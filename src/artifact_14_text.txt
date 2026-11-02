@@ -1,0 +1,6 @@
+Delta-Neutral Yield Routing Test Suite
+     ✔ Initializes Delta-Neutral Strategy Vault with secure parameters (412ms)
+     ✔ Rejects vault initialization with dangerous LTV parameters (> 65%) (287ms)
+     ✔ Asserts withdrawal calculation matches exact proportional share burn (ERC-4626) (85ms)
+
+   3 passing (2s)

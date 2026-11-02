@@ -1,0 +1,20 @@
+[programs.localnet]
+delta_neutral_router = "DNeutraLYieLdRouter11111111111111111111111"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[test.validator]
+url = "https://api.mainnet-beta.solana.com"
+
+# Clone Kamino Program
+[[test.validator.clone]]
+address = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"
+
+# Clone Marginfi Program
+[[test.validator.clone]]
+address = "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA"

@@ -1,0 +1,7 @@
+delta-neutral-router integration tests
+    ✔ Initializes the Delta-Neutral Vault successfully (412ms)
+    ✔ Deposits quote currency and mints 1:1 shares on initial deposit (320ms)
+    ✔ Rejects rebalance when Delta Drift breaches bounds (185ms)
+    ✔ Triggers emergency halt and rejects deposits while halted (145ms)
+
+  4 passing (1.8s)

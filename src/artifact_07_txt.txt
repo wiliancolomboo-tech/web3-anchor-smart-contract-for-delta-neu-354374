@@ -1,0 +1,23 @@
++----------------------------------------------------------------------------------------------------+
+|                                    SECURITY AUDIT VECTOR MATRIX                                    |
++------------------------------------+---------------------------------------------------------------+
+| Threat Category                    | Program Defense / Mitigation Mechanism                        |
++------------------------------------+---------------------------------------------------------------+
+| PDA Substitution / Spoofing        | Hardcoded seeds with authority pubkey binding:                |
+|                                    | seeds = [b"strategy_vault", authority.key().as_ref()]         |
++------------------------------------+---------------------------------------------------------------+
+| Reentrancy via CPI Callback        | Transient boolean lock (is_locked: bool) toggled to true     |
+|                                    | at instruction entry and released before exit.                |
++------------------------------------+---------------------------------------------------------------+
+| Flash-Loan Oracle Manipulation     | Pyth confidence bounds verification (conf * 100 <= price)     |
+|                                    | + Max age enforcement (clock_ts - publish_time <= 60s).       |
++------------------------------------+---------------------------------------------------------------+
+| Incomplete Unwind Liquidations     | Health factor invariant check prior to processing withdraws; |
+|                                    | enforces full short debt coverage prior to USDC distribution. |
++------------------------------------+---------------------------------------------------------------+
+| Arithmetic Overflows / Precision   | Strict checked_add, checked_sub, and checked_mul operations;   |
+|                                    | u128 intermediate casts for cross-decimal normalization.      |
++------------------------------------+---------------------------------------------------------------+
+| Missing Signer / Ownership         | Anchor `Signer<'info>` for both authority & keeper;           |
+|                                    | `has_one = authority` constraints on mutating contexts.      |
++------------------------------------+---------------------------------------------------------------+

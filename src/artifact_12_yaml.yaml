@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  aura-keeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aura_delta_keeper_production
+    restart: always
+    environment:
+      - SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+      - KEEPER_KEYPAIR_PATH=/run/secrets/keeper_keypair.json
+      - PROGRAM_ID=AuraDe1taYieldRouter1111111111111111111111
+      - USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+      - SLACK_WEBHOOK_URL=https://api.example.com/webhooks/alerts/placeholder
+      - RESEND_API_KEY=re_123456789abcdef
+      - ESCALATION_EMAIL=risk-alerts@protocol.fi
+    volumes:
+      - ./keeper-keypair.json:/run/secrets/keeper_keypair.json:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"

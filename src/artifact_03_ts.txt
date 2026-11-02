@@ -1,0 +1,215 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, createMint, getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
+import { expect } from "chai";
+
+describe("delta-neutral-router", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace.DeltaNeutralRouter as Program;
+  const admin = provider.wallet.publicKey;
+  let configPda: PublicKey;
+  let strategyPda: PublicKey;
+  let strategyAuthority: PublicKey;
+  let mintA: PublicKey;
+  let userAta: PublicKey;
+  let stratVaultAta: PublicKey;
+  let userSource: any;
+  let strategyId = new anchor.BN(1);
+
+  before(async () => {
+    [configPda] = PublicKey.findProgramAddressSync([Buffer.from("router-config")], program.programId);
+
+    // create mint + user vault
+    mintA = await createMint(provider.connection, provider.wallet.payer, admin, null, 9);
+    userSource = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      provider.wallet.payer,
+      mintA,
+      admin
+    );
+    userAta = userSource.address;
+
+    [strategyPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("strategy"), admin.toBuffer(), strategyId.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    [strategyAuthority] = PublicKey.findProgramAddressSync(
+      [Buffer.from("strategy-authority"), strategyPda.toBuffer()],
+      program.programId
+    );
+
+    // create strategy collateral ATA owned by strategy authority
+    stratVaultAta = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      provider.wallet.payer,
+      mintA,
+      strategyAuthority,
+      true
+    ).then((a) => a.address);
+
+    await mintTo(provider.connection, provider.wallet.payer, mintA, userAta, provider.wallet.payer, 1_000_000_000);
+  });
+
+  it("initializes router and creates strategy", async () => {
+    await program.methods
+      .initializeRouter(
+        strategyPda, // keeper
+        20, // 0.2% fee
+        admin // treasury
+      )
+      .accounts({
+        admin,
+        config: configPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    await program.methods
+      .createStrategy(
+        strategyId,
+        10000, // target 1:1
+        50,    // threshold 0.5%
+        12000, // max 1.2x
+        5000,  // min 0.5x
+        mintA,
+        mintA,
+        admin
+      )
+      .accounts({
+        admin,
+        config: configPda,
+        strategy: strategyPda,
+        strategyAuthority,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const strat = await program.account.strategy.fetch(strategyPda);
+    expect(strat.authority.toBase58()).to.eq(admin.toBase58());
+    expect(strat.targetDeltaBps).to.eq(10000);
+    expect(strat.active).to.eq(false);
+  });
+
+  it("opens, rebalances, and closes without protocol CPI in mock mode", async () => {
+    // user funds strategy
+    await program.methods
+      .openPosition(strategyId, new anchor.BN(1_000_000), 10000)
+      .accounts({
+        user: admin,
+        config: configPda,
+        strategy: strategyPda,
+        strategyAuthority,
+        userSource: userAta,
+        strategyCollateralVault: stratVaultAta,
+        // external accounts are mocked in mock-integrations mode / not executed
+        kaminoProgram: SystemProgram.programId,
+        kaminoCollateralVault: stratVaultAta,
+        kaminoCollateralReserve: userAta,
+        marginfiProgram: SystemProgram.programId,
+        marginfiObligation: stratVaultAta,
+        marginfiReserve: userAta,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    let strat = await program.account.strategy.fetch(strategyPda);
+    expect(strat.active).to.eq(true);
+    expect(Number(strat.collateralAmount)).to.eq(1_000_000);
+    expect(Number(strat.debtAmount)).to.eq(1_000_000);
+
+    // no-op rebalance (same target ratio)
+    await program.methods
+      .rebalance(10000, 100)
+      .accounts({
+        authorizedMaintainer: admin,
+        config: configPda,
+        strategy: strategyPda,
+        strategyAuthority,
+        strategyCollateralVault: stratVaultAta,
+        strategyDebtVault: stratVaultAta,
+        marginfiProgram: SystemProgram.programId,
+        marginfiObligation: stratVaultAta,
+        marginfiReserve: userAta,
+        kaminoProgram: SystemProgram.programId,
+        kaminoCollateralVault: stratVaultAta,
+        kaminoCollateralReserve: userAta,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    // move strategy target to force rebalance action
+    await program.methods
+      .updateStrategy(
+        null, // target_delta_bps
+        null, // threshold
+        null,
+        null,
+        null
+      )
+      .accounts({ admin, config: configPda, strategy: strategyPda })
+      .remainingAccounts([])
+      .rpc();
+
+    // close (mock mode repays/withdraws internally in program logic only)
+    await program.methods
+      .closePosition()
+      .accounts({
+        user: admin,
+        config: configPda,
+        strategy: strategyPda,
+        strategyAuthority,
+        strategyCollateralVault: stratVaultAta,
+        userDestination: userAta,
+        kaminoProgram: SystemProgram.programId,
+        marginfiProgram: SystemProgram.programId,
+        marginfiObligation: stratVaultAta,
+        marginfiReserve: userAta,
+        kaminoCollateralVault: stratVaultAta,
+        kaminoCollateralReserve: userAta,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    strat = await program.account.strategy.fetch(strategyPda);
+    expect(strat.active).to.eq(false);
+    expect(Number(strat.collateralAmount)).to.eq(0);
+    expect(Number(strat.debtAmount)).to.eq(0);
+  });
+
+  it("guards pause and unauthorized paths", async () => {
+    await program.methods
+      .setPause(true, new anchor.BN(3600))
+      .accounts({ admin, config: configPda })
+      .rpc();
+
+    try {
+      await program.methods
+        .rebalance(10000, 100)
+        .accounts({
+          authorizedMaintainer: admin,
+          config: configPda,
+          strategy: strategyPda,
+          strategyAuthority,
+          strategyCollateralVault: stratVaultAta,
+          strategyDebtVault: stratVaultAta,
+          marginfiProgram: SystemProgram.programId,
+          marginfiObligation: stratVaultAta,
+          marginfiReserve: userAta,
+          kaminoProgram: SystemProgram.programId,
+          kaminoCollateralVault: stratVaultAta,
+          kaminoCollateralReserve: userAta,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc();
+      expect.fail("should fail when paused");
+    } catch (err: any) {
+      expect(err.toString()).to.contain("Paused");
+    }
+
+    // unpause
+    await program.methods.setPause(false, new anchor.BN(0)).accounts({ admin, config: configPda }).rpc();
+  });
+});

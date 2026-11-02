@@ -1,0 +1,17 @@
+[programs.localnet]
+neutra_yield = "NeutrAY1eLdRouter11111111111111111111111111"
+
+[test.validator]
+url = "https://api.mainnet-beta.solana.com"
+
+# Clone Kamino Lending Program
+[[test.validator.clone]]
+address = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"
+
+# Clone Marginfi v2 Program
+[[test.validator.clone]]
+address = "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA"
+
+# Clone Pyth SOL/USD Oracle
+[[test.validator.clone]]
+address = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4SEBy6"

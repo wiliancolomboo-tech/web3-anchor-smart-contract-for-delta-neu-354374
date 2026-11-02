@@ -1,0 +1,20 @@
+[toolchain]
+anchor_version = "0.29.0"
+
+[features]
+seeds = true
+skip-lint = false
+
+[programs.localnet]
+delta_neutral_router = "DNRYi3Vf77XvE1t78fK3mKUPe9f1yYfU1xV41R6W9Kzp"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+keeper = "ts-node keeper/bot.ts"

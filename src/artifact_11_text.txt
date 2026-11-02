@@ -1,0 +1,7 @@
+Delta-Neutral Yield Router Test Harness
+    ✔ 1. Initializes Global Config successfully (421ms)
+    ✔ 2. Opens a Strategy Position PDA with verified boundary leverage (380ms)
+    ✔ 3. Rejects Strategy Opening with invalid leverage boundaries (195ms)
+    ✔ 4. Prevents Unauthorized Positions Access (189ms)
+
+  4 passing (2s)

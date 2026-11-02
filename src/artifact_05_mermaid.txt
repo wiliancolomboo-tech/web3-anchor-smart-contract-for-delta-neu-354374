@@ -1,0 +1,46 @@
+flowchart TD
+    subgraph UserInterface["Client & Automation Layer"]
+        U[User / Liquidity Provider]
+        K[Automated Keeper / Crank Bot]
+    end
+
+    subgraph ProgramCore["Aegis Yield Router (Anchor Program)"]
+        VA[Global Strategy Vault PDA<br/>`seeds = [b"vault", vault_id]`]
+        UA[User Position PDA<br/>`seeds = [b"position", user, vault]`]
+        SA[Strategy Authority PDA<br/>`seeds = [b"authority", vault]`]
+        
+        subgraph RiskEngine["Risk & Valuation Engine"]
+            ORACLE[Pyth Network Price Feeds<br/>SOL/USD & USDC/USD]
+            CALC[Delta & Health Factor Validator<br/>Δ_total == 0 & HF ≥ 1.25]
+        end
+    end
+
+    subgraph ExternalProtocols["Target Money Markets (CPI Targets)"]
+        subgraph Kamino["Kamino Lending / Collateral"]
+            KM_POOL[Kamino Reserve & Collateral Obligation]
+        end
+        subgraph Marginfi["Marginfi Margin Protocol"]
+            MF_BANK[Marginfi Bank & Margin Account]
+        end
+    end
+
+    %% Flow routes
+    U -->|1. Deposit USDC / Mint Vault Shares| VA
+    VA -->|2. Track Position| UA
+    
+    K -->|Trigger Rebalance / Harvest| VA
+    VA -->|3. Fetch Price & Confidence| ORACLE
+    ORACLE -->|4. Confidence Interval Passed| CALC
+    
+    CALC -->|5. Verify Symmetrical Delta & LTV| SA
+    
+    SA -->|6a. CPI: Supply SOL/USDC Collateral| KM_POOL
+    SA -->|6b. CPI: Borrow Base / Supply Hedge| MF_BANK
+
+    classDef core fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC;
+    classDef ext fill:#0F172A,stroke:#F59E0B,stroke-width:2px,color:#F8FAFC;
+    classDef user fill:#0F172A,stroke:#10B981,stroke-width:2px,color:#F8FAFC;
+    
+    class VA,UA,SA,CALC core;
+    class KM_POOL,MF_BANK,ORACLE ext;
+    class U,K user;

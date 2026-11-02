@@ -1,0 +1,23 @@
+FROM node:20-slim AS builder
+
+WORKDIR /usr/src/app
+
+COPY package.json yarn.lock* package-lock.json* ./
+RUN npm install
+
+COPY tsconfig.json ./
+COPY src ./src
+COPY target/idl ./target/idl
+
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+COPY --from=builder /usr/src/app/node_modules ./node_modules
+COPY --from=builder /usr/src/app/package.json ./package.json
+COPY --from=builder /usr/src/app/src ./src
+COPY --from=builder /usr/src/app/target ./target
+COPY --from=builder /usr/src/app/tsconfig.json ./tsconfig.json
+
+ENV NODE_ENV=production
+ENTRYPOINT ["npx", "ts-node", "src/keeper.ts"]

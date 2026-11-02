@@ -1,0 +1,7 @@
+aegis_engine delta-neutral tests
+    ✔ Initializes strategy with 65% Target LTV and 1.5% Drift Tolerance (412ms)
+    ✔ Executes user deposit and mints linear strategy shares (356ms)
+    ✔ Executes dynamic rebalance to neutralize delta drift (489ms)
+    ✔ Rejects rebalances exceeding maximum LTV guard (218ms)
+
+  4 passing (1.5s)

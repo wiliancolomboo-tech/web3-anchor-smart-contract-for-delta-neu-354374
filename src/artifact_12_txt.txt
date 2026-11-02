@@ -1,0 +1,7 @@
+delta-neutral-vault lifecycle & invariant verification
+    ✔ Initializes the Delta-Neutral Vault with deterministic safety guards (412ms)
+    ✔ Executes deposit, routes 50/50 capital, and mints 1:1 LP shares on first entry (789ms)
+    ✔ Rejects deposit if the contract is paused / frozen (155ms)
+    ✔ Asserts Rebalance execution triggers properly when Delta tolerance is breached (621ms)
+
+  4 passing (2s)

@@ -1,0 +1,20 @@
++---------------------------------------------------------------------------------------------------------+
+|                                    DEFENSIVE SECURITY DEFENSE MATRIX                                     |
++------------------------+-------------------+------------------------------------------------------------+
+| Attack Vector          | Severity / Impact | Architectural Mitigation Mechanism                         |
++------------------------+-------------------+------------------------------------------------------------+
+| Oracle Front-Running   | Critical          | Pyth confidence bound check (MAX_ORACLE_CONFIDENCE_BPS).   |
+| & Stale Pricing        | Drain of Vault    | Latency window enforced <= 30 seconds via Clock Sysvar.    |
++------------------------+-------------------+------------------------------------------------------------+
+| Flash Loan NAV         | High              | Single-slot deposit-withdraw locking. Share valuation is   |
+| Manipulation           | Share Inflation   | derived from historical oracle pricing + verified assets.  |
++------------------------+-------------------+------------------------------------------------------------+
+| Reentrancy via CPI     | Critical          | CEI pattern (Checks, Effects, Interactions). State mutates |
+| Loopback               | Double Spend      | prior to external protocol CPI execution.                  |
++------------------------+-------------------+------------------------------------------------------------+
+| Account Substitution   | High              | Explicit Anchor `has_one` relations, token::mint & token:: |
+| (Fake Bank/Vaults)     | Asset Theft       | authority checks enforced at account deserialization.      |
++------------------------+-------------------+------------------------------------------------------------+
+| LP Share Rounding      | Medium            | Minimum deposit amounts enforced; share math floor         |
+| Stealing Attack        | NAV Deflation     | rounding operates in favor of the vault, never user.       |
++------------------------+-------------------+------------------------------------------------------------+

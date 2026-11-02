@@ -1,0 +1,13 @@
+await program.methods
+  .initializeGlobal(
+     adminPubkey,
+     treasuryPubkey,
+     new BN(120),
+     new BN(20),
+     new BN(10_000_000),
+     50,
+     [keeper1, keeper2]
+  )
+  .accounts({ ... })
+  .signers([admin])
+  .rpc();

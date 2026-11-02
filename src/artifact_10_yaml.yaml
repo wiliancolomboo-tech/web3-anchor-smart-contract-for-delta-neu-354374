@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: "dnyr_keeper"
+    static_configs:
+      - targets: ["dnyr-keeper:8080"]

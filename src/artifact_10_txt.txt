@@ -1,0 +1,22 @@
++---------------------------------------------------------------------------------------------------------+
+|                                    SECURITY HARDENING MATRIX                                            |
++------------------------------------+--------------------------+-----------------------------------------+
+| Threat / Vulnerability Vector      | Severity                 | On-Chain Defense Mechanism              |
++------------------------------------+--------------------------+-----------------------------------------+
+| Oracle Front-Running & Latency     | CRITICAL                 | Pyth EMA integration; rejects staleness |
+| (Stale Pyth Price)                 |                          | > 60s and conf spread > 200 bps.        |
++------------------------------------+--------------------------+-----------------------------------------+
+| Arbitrage via Rebalance Front-Run  | HIGH                     | Enforces strict max_slippage_bps on     |
+| (Sandwiching Kamino Swaps)         |                          | quote outputs during CPI rebalances.    |
++------------------------------------+--------------------------+-----------------------------------------+
+| Flash Loan Exploit on Spot Yield   | CRITICAL                 | Flash-loaned tokens within same block   |
+|                                    |                          | cannot bypass Delta Divergence checks;  |
+|                                    |                          | UserPosition records last interaction.  |
++------------------------------------+--------------------------+-----------------------------------------+
+| Reentrancy during CPI Executions   | CRITICAL                 | CEI Pattern (Checks-Effects-Interactions|
+|                                    |                          | + Anchor PDA mutable borrow checks).    |
++------------------------------------+--------------------------+-----------------------------------------+
+| Rounding Exploits in Shares Math   | MEDIUM                   | High-precision 128-bit fixed-point math |
+|                                    |                          | with explicit floor rounding in favor   |
+|                                    |                          | of the Vault pool reserve.              |
++------------------------------------+--------------------------+-----------------------------------------+

@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  aegis-rebalancer-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      - SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+      - KEEPER_PRIVATE_KEY=${KEEPER_PRIVATE_KEY}
+      - PROGRAM_ID=Aegis11111111111111111111111111111111111111
+      - STRATEGY_VAULT_PUBKEY=${STRATEGY_VAULT_PUBKEY}
+      - ENTERPRISE_WEBHOOK_URL=${ENTERPRISE_WEBHOOK_URL}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

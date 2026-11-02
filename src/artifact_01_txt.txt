@@ -1,0 +1,10 @@
+┌────────────────────────────────────────────────────────┐
+                │             Aura-Delta Yield Router Vault              │
+                │                                                        │
+Depositor USDC ─┼──> [50% Collateral] ───> Marginfi Account ──> Borrow SOL│
+                │                                                  │     │
+                │                                                  ▼     │
+                └─────> [50% Capital] + Borrowed SOL ──────> Kamino Vault│
+                                                             (Yield Farm)│
+                                                                   │     │
+                                  Delta = Spot (SOL) - Debt (SOL) ≈ 0 ◄──┘

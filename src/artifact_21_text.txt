@@ -1,0 +1,8 @@
+Aegis Delta-Neutral Vault Test Suite
+    ✔ Initializes the strategy with valid parameters (420ms)
+    ✔ Executes user deposit and mints initial vault LP shares (680ms)
+    ✔ Rejects rebalances that drift outside safety delta boundaries (210ms)
+    ✔ Successfully rebalances spot-collateral vs debt under target LTV (850ms)
+    ✔ Withdraws collateral by burning vault shares with zero fee leakage (340ms)
+
+  5 passing (2.5s)

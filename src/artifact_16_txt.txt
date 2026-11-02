@@ -1,0 +1,18 @@
+┌────────────────────────┬──────────────────────────────────┬────────────────────────────────────────────────────────┐
+│ Threat Vector          │ Vulnerability Class              │ Programmatic Countermeasure                            │
+├────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Reentrancy             │ CPI State Hijack via Callback    │ State lock bit (is_locked = 1) enforced at entry;      │
+│                        │                                  │ cleared strictly at routine exit.                      │
+├────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Flash Loan Exploit     │ Single-block pool manipulation   │ Dynamic TWAP + Pyth EMA Price with confidence interval │
+│                        │ to trigger false liquidations    │ bounding: (conf / price) < 0.005 (0.5%).               │
+├────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Fake Account Injection │ Account Substitution in CPIs     │ Strict Anchor PDA constraints: seeds = [...] bump;     │
+│                        │                                  │ Explicit program IDs verified on Kamino and Marginfi.  │
+├────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Integer Overflow       │ Precision Loss / Token Draining  │ Rust checked math operations: checked_add,             │
+│                        │                                  │ checked_mul, checked_sub on all internal accounting.   │
+├────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Oracle Staleness       │ LTV Drift during Solana network  │ Require Clock::get()?.unix_timestamp - publish_time    │
+│                        │ congestion                       │ <= 30 seconds; else halt rebalance execution.          │
+└────────────────────────┴──────────────────────────────────┴────────────────────────────────────────────────────────┘

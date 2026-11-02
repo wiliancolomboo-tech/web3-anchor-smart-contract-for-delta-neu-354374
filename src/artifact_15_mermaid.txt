@@ -1,0 +1,4 @@
+flowchart LR
+    A[Threat Vector] --> B(Attack Surface)
+    B --> C{Program Guard}
+    C -->|Blocked| D[Safe Execution State]

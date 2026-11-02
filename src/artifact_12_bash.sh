@@ -1,0 +1,1 @@
+solana airdrop 2 ~/.config/solana/id.json

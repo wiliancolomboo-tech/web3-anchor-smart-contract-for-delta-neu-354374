@@ -1,0 +1,128 @@
+import * as anchor from "@coral-xyz/anchor";
+import { BN } from "@coral-xyz/anchor";
+import { PublicKey } from "@solana/web3.js";
+
+const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8899";
+const PROGRAM_ID = new PublicKey(process.env.PROGRAM_ID || "D1nN3utr41x1111111111111111111111111111111111");
+
+const provider = new anchor.AnchorProvider(
+  new anchor.web3.Connection(RPC_URL, "confirmed"),
+  anchor.Wallet.local(),
+  {}
+);
+
+anchor.setProvider(provider);
+const program = new anchor.Program(
+  require("../target/idl/delta_neutral_router.json"),
+  PROGRAM_ID,
+  provider
+);
+
+const BPS = 10_000;
+
+function targetFromRatio(kamino: bigint, marginfi: bigint, ratioBps: number): bigint {
+  const total = kamino + marginfi;
+  return (total * BigInt(ratioBps)) / BigInt(BPS);
+}
+
+async function fetchOracleSlot(program: any): Promise<bigint> {
+  return BigInt((await provider.connection.getSlot("confirmed")).toString());
+}
+
+async function getStrategyIds(): Promise<PublicKey[]> {
+  // Load from config (or indexed state table)
+  return [];
+}
+
+function encodeIxForKamino(direction: "toMarginfi" | "toKamino", amount: BN): Uint8Array {
+  // TODO: replace with true SDK-generated instruction encoding
+  // this placeholder emits protocol-specific opcode + amount.
+  const op = direction === "toMarginfi" ? 0x10 : 0x11;
+  const data = new Uint8Array(1 + 8);
+  data[0] = op;
+  data.set(amount.toArray("le", 8), 1);
+  return data;
+}
+
+function encodeIxForMarginfi(direction: "toMarginfi" | "toKamino", amount: BN): Uint8Array {
+  const op = direction === "toMarginfi" ? 0x20 : 0x21;
+  const data = new Uint8Array(1 + 8);
+  data[0] = op;
+  data.set(amount.toArray("le", 8), 1);
+  return data;
+}
+
+async function runOnce() {
+  const globalPda = PublicKey.findProgramAddressSync([Buffer.from("global-config-v1")], PROGRAM_ID)[0];
+  const global = await program.account.globalState.fetch(globalPda);
+
+  // enumerate configured strategies from indexer/db; simplified single strategy for example
+  // keepers should load kamino/marginfi exposures from indexing endpoints
+  const strategyPda = PublicKey.findProgramAddressSync(
+    [Buffer.from("strategy-v1"), provider.wallet.publicKey.toBuffer(), Buffer.from(new BigUint64Array([1]).buffer)],
+    PROGRAM_ID
+  )[0];
+  const snapPda = PublicKey.findProgramAddressSync([Buffer.from("snapshot-v1"), strategyPda.toBuffer()], PROGRAM_ID)[0];
+  const strategy = await program.account.strategy.fetch(strategyPda);
+  const snapshot = await program.account.strategySnapshot.fetch(snapPda);
+
+  // Replace with production oracle-protocol fetch
+  const kaminoExposure = 7_000_000_000n;
+  const marginfiExposure = 6_400_000_000n;
+
+  const target = targetFromRatio(kaminoExposure, marginfiExposure, strategy.targetRatioBps);
+  const delta = (kaminoExposure > target) ? (kaminoExposure - target) : (target - kaminoExposure);
+  const total = kaminoExposure + marginfiExposure;
+  const deviationBps = total > 0n ? Number((delta * BigInt(BPS)) / total) : 0;
+
+  if (deviationBps <= strategy.rebalanceThresholdBps) {
+    return;
+  }
+
+  const direction = kaminoExposure > target ? 0 : 1;
+  const preferredAmount = new BN(Number(delta));
+
+  const nowSlot = await fetchOracleSlot(program);
+  const amount = preferredAmount;
+
+  const kaminoIx = direction === 0 ? encodeIxForKamino("toMarginfi", amount) : encodeIxForKamino("toMarginfi", amount); // placeholder
+  const marginfiIx = direction === 0 ? encodeIxForMarginfi("toMarginfi", amount) : encodeIxForMarginfi("toMarginfi", amount); // placeholder
+
+  await program.methods
+    .executeRebalance({
+      oracleSlot: new BN(nowSlot.toString()),
+      oracleTs: new BN(Math.floor(Date.now() / 1000)),
+      kaminoExposure: new anchor.BN(kaminoExposure.toString()),
+      marginfiExposure: new anchor.BN(marginfiExposure.toString()),
+      preferredAmount: amount,
+      routeDirection: direction,
+      userSlippageBps: strategy.rebalanceThresholdBps,
+      dryRun: false,
+      kaminoIxData: Buffer.from(kaminoIx),
+      marginfiIxData: Buffer.from(marginfiIx),
+    })
+    .accounts({
+      global: globalPda,
+      strategy: strategyPda,
+      snapshot: snapPda,
+      keeper: provider.wallet.publicKey,
+      treasury: global.treasury,
+      kaminoProgram: new PublicKey("11111111111111111111111111111111"),   // placeholder
+      marginfiProgram: new PublicKey("11111111111111111111111111111111"),  // placeholder
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
+    .rpc();
+}
+
+async function main() {
+  while (true) {
+    try {
+      await runOnce();
+    } catch (err) {
+      console.error("keeper error:", err);
+    }
+    await new Promise((r) => setTimeout(r, 20_000));
+  }
+}
+
+main().catch(console.error);

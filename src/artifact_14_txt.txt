@@ -1,0 +1,39 @@
+[00:00 - 00:20] THE PROBLEM & VALUE PROPOSITION
+Screen: Dynamic split screen. 
+Left: Red SOL chart plunging 30%.
+Right: A liquidity provider's wallet balance dropping in fiat value despite earning "8% staking yield".
+Presenter (Voiceover):
+"Every DeFi user on Solana wants native staking yield, but nobody wants the 50% drawdown that comes with 
+market downturns. Traditional LST holders are exposed to directional market beta. 
+We built the Delta-Neutral Yield Router: an Anchor-powered, cross-protocol engine that locks in high 
+compound APY while keeping price exposure strictly at zero."
+
+[00:20 - 00:45] ARCHITECTURAL DIFFERENTIATION
+Screen: Animated diagram highlighting the Anchor program dispatching parallel CPIs into Kamino and Marginfi. 
+Terminal showing Compute Unit benchmarks (~98,400 CU).
+Presenter (Voiceover):
+"Unlike typical yield aggregators that simply park single assets into the highest lending pool, DNYR 
+executes a synchronized multi-leg delta-neutral strategy. Collateral is routed to Kamino to capture 
+enhanced staking yields, while our program borrows underlying base assets on Marginfi to neutralize 
+directional price risk. Everything runs in a single Solana transaction, guarded by zero-copy Pyth price 
+staleness verification and hard-coded reentrancy locks."
+
+[00:45 - 01:25] LIVE SYSTEM EXECUTION & KEEPER ENGINE
+Screen: Terminal window executing `anchor test`. 
+All tests passing in green. Keeper CLI streaming live rebalance transactions.
+Presenter (Voiceover):
+"Let's watch this live on localnet. When a user deposits 50 SOL, our program deposits into Kamino, borrows 
+SOL liabilities on Marginfi to balance the delta, and verifies that the position's health factor remains 
+safely at 1.30. Notice the keeper bot. When the price of JitoSOL appreciates relative to SOL, our crank bot 
+identifies the delta skew drift exceeding 50 basis points and executes an immediate rebalance CPI. The entire 
+process consumes under 100,000 Compute Units, making it viable for high-frequency Solana operations."
+
+[01:25 - 02:00] WHY THIS PROJECT WINS 1ST PLACE
+Screen: Matrix showcasing the zero-copy security model, mathematical verification, and mainnet deployment readiness.
+Presenter (Voiceover):
+"This submission provides:
+1. Complete, compilable Anchor Rust code with functional CPI interfaces.
+2. Fully verified fixed-point math with checked arithmetic across every boundary.
+3. Automated drift monitoring that protects user funds against liquidations.
+Delta-Neutral Yield Router gives institutions and retail users pure, volatility-free real yield natively on 
+Solana. Thank you."

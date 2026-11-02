@@ -1,0 +1,1 @@
+ts-node keeper/bot.ts

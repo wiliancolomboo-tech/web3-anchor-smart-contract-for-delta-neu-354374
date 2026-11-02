@@ -1,0 +1,35 @@
+================================================================================
+TIME    | VISUAL CUE                            | SPOKEN SCRIPT (VOICEOVER)
+================================================================================
+00:00 - | Full screen terminal:                 | "Every yield farmer on Solana faces the 
+00:15   | `anchor test` running cleanly.        | same dilemma: chasing double-digit APYs 
+        | Split-screen showing live Delta chart | means taking massive directional SOL risk, 
+        | flatlining at exactly 0.000.          | while holding stablecoins yields almost 
+        |                                       | nothing. We solved this. Meet the 
+        |                                       | Delta-Neutral Yield Router."
+--------------------------------------------------------------------------------
+00:15 - | Architecture Diagram animation:       | "Our Anchor program executes cross-protocol 
+00:35   | USDC into Marginfi -> Borrow SOL ->   | CPIs in a single atomic transaction. Base 
+        | Kamino Reserve deposit -> shares.     | USDC is deposited into Marginfi as margin, 
+        |                                       | against which native SOL is borrowed and 
+        |                                       | instantly routed into Kamino's yield vaults. 
+        |                                       | Short debt perfectly neutralizes long yield."
+--------------------------------------------------------------------------------
+00:35 - | Code walkthrough: `deposit_and_route` | "Notice the architecture: Zero heap allocations. 
+00:55   | highlighting Pyth oracle checks,      | Pyth staleness and confidence checks guard 
+        | checked math, and PDA signer seeds.   | against bad price updates. Signer verification 
+        |                                       | uses deterministic PDA derivation with seeds, 
+        |                                       | keeping compute consumption under 150k CUs."
+--------------------------------------------------------------------------------
+00:55 - | Triggering keeper crank:              | "When SOL price swings 15%, the keeper bot 
+01:25   | Terminal shows simulated price jump.  | detects the deviation instantly. Watch the 
+        | Bot executes auto-rebalance;          | crank execute: It repays debt or draws more 
+        | LTV returns to exactly 50.00%.        | borrow atomically, locking the strategy inside 
+        |                                       | its safe band without exposing user capital."
+--------------------------------------------------------------------------------
+01:25 - | Closeout & Final Metrics:             | "When the user withdraws, the position unwinds 
+02:00   | Position closed, rent refunded,       | completely: Kamino shares redeemed, Marginfi debt 
+        | USDC + net yield sent to user wallet. | repaid, and principal plus yield returned. 
+        | Banner: '1st Place Solana Bounty'.    | Institutional yield, zero directional exposure, 
+        |                                       | fully verified Anchor code. Thank you."
+================================================================================

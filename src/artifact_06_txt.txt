@@ -1,0 +1,10 @@
+┌──────────────────────────────┬───────────────────────────────┬────────────────────────────────────────────┐
+│ Threat Vector                │ Vulnerability Class           │ Program Defense Architecture               │
+├──────────────────────────────┼───────────────────────────────┼────────────────────────────────────────────┤
+│ Cross-Program Reentrancy     │ Reentrancy via CPI callbacks  │ Transient state lock (reentrancy_locked)   │
+│ Oracle Frontrunning / Stale  │ Arbitrage against stale Pyth  │ pyth_sdk_solana staleness max 60s & conf   │
+│ Signer Seed Impersonation    │ Forge CPI instructions        │ PDA bumps cached in state, strict seeds    │
+│ Stack Frame Overflow         │ BPF 4KB stack limit breach    │ Heavy accounts allocated via Box<T> heap   │
+│ Liquidation via Margin Spill │ Extreme market movement       │ Hard ceiling MAX_SAFE_LTV_BPS (65.0%)      │
+│ Delta Exploitation           │ Micro-arbitrage keeper spam   │ Strict minimum delta threshold enforcement │
+└──────────────────────────────┴───────────────────────────────┴────────────────────────────────────────────┘

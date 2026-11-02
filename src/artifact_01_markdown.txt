@@ -1,0 +1,32 @@
+# Anchor Smart Contract for Delta-Neutral Yield Routing (Solana)
+
+## 1) Executive Technical Summary & System Value Proposition
+
+This deliverable implements a production-oriented **Anchor program** for automated delta-neutral vault operations with **Keeper-driven CPI orchestration** to Kamino and Marginfi.
+
+### What it does
+
+- Maintains a vault account with deterministic PDAs and risk controls.
+- Supports multi-user deposits/withdrawals via internal share accounting.
+- Exposes keeper operations:
+  - `rebalance` (policy + CPI routing to Kamino/Marginfi)
+  - `harvest` (generic CPI pass-through to protocol)
+- Enforces strict security guards:
+  - authority/keeper signing policy
+  - pause switch
+  - cooldown + threshold gating
+  - max AUM and deviation caps
+  - whitelisted external program IDs
+- Is structured for production observability and extension (events, explicit params, structured errors, test matrix).
+
+### Value Proposition
+
+1. **Deterministic safety**: vault authority is PDA-based, reducing mutable key risk.
+2. **Autonomy-ready**: keeper loop can trigger periodic rebalance using onchain-state/price signals.
+3. **Protocol-agnostic CPI layer**: adapters can evolve when Kamino/Marginfi interfaces change, while core risk controls remain stable.
+4. **Composable**: vault share model allows many LPs, with explicit accounting and clear state transitions.
+5. **Operational performance**: early-return guards and single instruction for decisioning reduce CU waste.
+
+---
+
+## 2) Complete Visual Architecture Flowchart

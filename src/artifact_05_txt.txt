@@ -1,0 +1,21 @@
++-----------------------------------------------------------------------------------------------+
+| DEFENSE LAYER                 THREAT VECTOR MITIGATED            IMPLEMENTATION MECHANISM     |
++===============================================================================================+
+| Canonical PDA Derivations     Seed collisions & spoofing         bumps bound inside State     |
+|                                                                  seeds: [b"vault", id]        |
++-----------------------------------------------------------------------------------------------+
+| Oracle Freshness Bounds       Stale oracle / sandwich attacks    load_price_feed checked      |
+|                                                                  staleness <= 60 seconds      |
++-----------------------------------------------------------------------------------------------+
+| Oracle Confidence Gating      Flash loan price manip / illiquid  conf / price <= 0.50%        |
+|                               distortions                        (MAX_CONFIDENCE_RATIO = 50)  |
++-----------------------------------------------------------------------------------------------+
+| Reentrancy Lock               Cross-protocol callback execution  strategy.is_rebalancing     |
+|                               transient manipulation             transient guard flag checks  |
++-----------------------------------------------------------------------------------------------+
+| Dynamic Leverage Boundary     Liquidation cascade risk           Max LTV enforced at 65%;     |
+|                                                                  hard revert at > 6500 bps    |
++-----------------------------------------------------------------------------------------------+
+| Signer Constrained Vaults     Arbitrary withdrawal exploit       Token transfers gated to     |
+|                                                                  seeds: [b"authority", vault] |
++-----------------------------------------------------------------------------------------------+

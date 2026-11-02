@@ -1,0 +1,15 @@
+┌────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+│ VULNERABILITY CLASS    │ ON-CHAIN MITIGATION / DEFENSIVE ARCHITECTURE IMPLEMENTED               │
+├────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+│ Reentrancy             │ Manual position.reentrancy_lock boolean check enforced across handlers │
+├────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+│ Oracle Exploits        │ Pyth confidence interval (<1% width) and staleness (<30s) verification │
+├────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+│ Frontrunning / MEV     │ Dynamic priority fees & slippage limits enforced on Kamino minting     │
+├────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+│ Bad Debt / Liquidation │ Hard 68% LTV ceiling prevents unsafe deposit parameters                │
+├────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+│ Rogue Signers          │ strict `has_one = keeper` and `has_one = admin` Anchor constraints     │
+├────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+│ Rounding Underflow     │ Explicit checked_mul/checked_div with 128-bit intermediate widening    │
+└────────────────────────┴────────────────────────────────────────────────────────────────────────┘

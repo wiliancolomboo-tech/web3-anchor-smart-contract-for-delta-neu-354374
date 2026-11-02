@@ -1,0 +1,27 @@
++-----------+-----------------------------------------------+-------------------------------------------------+
+| Timestamp | Screen Display / Visuals                      | Spoken Voiceover Script                         |
++-----------+-----------------------------------------------+-------------------------------------------------+
+| 0:00-0:15 | Split screen: Wild crypto price chart vs flat | "Yield in DeFi shouldn't require betting on     |
+|           | stable yield curve. Vault 3D architecture.    | directional volatility. What if you could earn   |
+|           |                                               | double-digit APY on Solana with zero market     |
+|           |                                               | exposure? Introducing the Delta-Neutral Vault." |
++-----------+-----------------------------------------------+-------------------------------------------------+
+| 0:15-0:40 | Terminal split: VS Code Anchor source +       | "Our Anchor program routes liquidity into a     |
+|           | Mermaid diagram animation showing atomic CPI  | mathematically balanced hedge: supplying spot   |
+|           | to Marginfi & Kamino.                         | yield LSTs while borrowing matching spot via     |
+|           |                                               | Marginfi, locking delta drift below 1.5%."      |
++-----------+-----------------------------------------------+-------------------------------------------------+
+| 0:40-1:10 | Running `anchor test` with all suites         | "Watch our test suite run against real mock     |
+|           | passing, followed by CU profile table in      | states. We benchmarked under 79,000 Compute      |
+|           | green text.                                   | Units for complex multi-CPI rebalances,         |
+|           |                                               | guarded by Pyth low-latency price validation."  |
++-----------+-----------------------------------------------+-------------------------------------------------+
+| 1:10-1:35 | Live Keeper Bot terminal executing            | "Here, our keeper bot tracks oracle drift. The  |
+|           | `evaluateAndRebalance()` catching a simulated | moment price diverges, an atomic rebalance is   |
+|           | 2.1% market divergence.                       | fired in one single slot. No bad debt, no       |
+|           |                                               | unhedged exposure, zero liquidations."          |
++-----------+-----------------------------------------------+-------------------------------------------------+
+| 1:35-1:58 | UI Dashboard preview + GitHub repo with       | "Production-grade code, zero-copy security,     |
+|           | architecture docs. Trophy / 1st place badge.   | maximum capital efficiency on Solana. That is   |
+|           |                                               | how we scale DeFi liquidity. Thank you."        |
++-----------+-----------------------------------------------+-------------------------------------------------+

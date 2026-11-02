@@ -1,0 +1,74 @@
+flowchart TD
+    subgraph Client & Off-Chain Infrastructure
+        User([Depositor / LP])
+        Keeper([Automated Keeper Crank Bot])
+        PythOracle([Pyth Network Oracles<br>SOL/USD & USDC/USD])
+    end
+
+    subgraph Anchor Delta-Neutral Program [delta-neutral-router Program]
+        InitVault[Init Strategy Vault Instruction]
+        DepositIX[Deposit USDC & Mint Shares]
+        RebalanceIX[Rebalance & Route Delta-Neutral Position]
+        HarvestIX[Harvest Yield & Compound]
+        WithdrawIX[Redeem Shares & Unwind]
+        
+        subgraph PDA State Accounts
+            VaultState[(Vault Configuration PDA<br>seeds: 'vault', vault_id)]
+            VaultAuthority[(Vault PDA Authority<br>seeds: 'authority', vault.key)]
+            ShareMint[(SPL Share Mint PDA<br>seeds: 'shares', vault.key)]
+            USDCVault[(Vault USDC Escrow ATA)]
+        end
+    end
+
+    subgraph Marginfi Protocol [Marginfi Program CPI]
+        MF_Group[(Marginfi Group)]
+        MF_Account[(Strategy Marginfi Account PDA)]
+        MF_USDCLend[(Marginfi USDC Bank / Collateral)]
+        MF_SOLBorrow[(Marginfi SOL Bank / Debt)]
+    end
+
+    subgraph Kamino Protocol [Kamino Lending / k-Pool CPI]
+        KM_Market[(Kamino Market State)]
+        KM_Collateral[(Kamino SOL Reserve / Supply)]
+        KM_Obligation[(Strategy Kamino Obligation)]
+    end
+
+    %% Deposit Flow
+    User -->|1. Deposit USDC| DepositIX
+    DepositIX -->|Issue Shares| ShareMint
+    ShareMint -.->|Mint LP Tokens| User
+    DepositIX -->|Transfer USDC| USDCVault
+
+    %% Keeper & Rebalance Flow
+    PythOracle -.->|Fetch Price Feeds| Keeper
+    Keeper -->|2. Trigger Dynamic Rebalance| RebalanceIX
+    RebalanceIX -->|Check Feeds: CI / P < 0.5%| PythOracle
+    RebalanceIX -->|Verify Authority Signature| VaultAuthority
+
+    %% CPI Routing
+    RebalanceIX -->|3a. Deposit USDC Collateral| MF_USDCLend
+    RebalanceIX -->|3b. Borrow SOL against USDC| MF_SOLBorrow
+    MF_SOLBorrow -->|Disburse SOL| VaultAuthority
+    VaultAuthority -->|3c. Deposit Borrowed SOL into Yield Reserve| KM_Collateral
+    KM_Collateral -->|Yield Accrues| KM_Obligation
+
+    %% Harvest & Compounding
+    Keeper -->|4. Crank Yield Harvest| HarvestIX
+    HarvestIX -->|Claim Kamino LP/Supply Rewards| KM_Collateral
+    HarvestIX -->|Pay Marginfi Borrow Interest| MF_SOLBorrow
+    HarvestIX -->|Surplus USDC Reinvested| USDCVault
+
+    %% Withdrawal Flow
+    User -->|5. Burn LP Shares| WithdrawIX
+    WithdrawIX -->|Unwind Kamino Position| KM_Collateral
+    WithdrawIX -->|Repay SOL Borrow| MF_SOLBorrow
+    WithdrawIX -->|Withdraw USDC Collateral| MF_USDCLend
+    WithdrawIX -->|Return Net USDC| User
+
+    %% Security styling
+    classDef security fill:#ffebee,stroke:#c62828,stroke-width:2px;
+    classDef cpi fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef state fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
+    class VaultState,VaultAuthority,ShareMint,USDCVault state;
+    class MF_Group,MF_Account,MF_USDCLend,MF_SOLBorrow,KM_Market,KM_Collateral,KM_Obligation cpi;
+    class PythOracle security;

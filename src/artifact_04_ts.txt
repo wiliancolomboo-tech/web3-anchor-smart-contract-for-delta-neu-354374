@@ -1,0 +1,266 @@
+import * as anchor from "@coral-xyz/anchor";
+import { BN } from "@coral-xyz/anchor";
+import { assert } from "chai";
+
+describe("delta_neutral_router", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace.DeltaNeutralRouter as anchor.Program;
+  const admin = provider.wallet; // use default test wallet as admin
+  const keeper = anchor.web3.Keypair.generate();
+
+  const strategySeed = new BN(2026);
+  let globalPda: anchor.web3.PublicKey;
+  let strategyPda: anchor.web3.PublicKey;
+  let snapshotPda: anchor.web3.PublicKey;
+
+  const sleep = async (ms: number) =>
+    await new Promise((resolve) => setTimeout(resolve, ms));
+
+  before(async () => {
+    [globalPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("global-config-v1")],
+      program.programId
+    );
+
+    const txSig = await provider.connection.requestAirdrop(
+      keeper.publicKey,
+      2 * anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(txSig);
+
+    const info = await provider.connection.getAccountInfo(globalPda);
+    if (info) return;
+
+    [strategyPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("strategy-v1"),
+        admin.publicKey.toBuffer(),
+        strategySeed.toArrayLike(Buffer, "le", 8),
+      ],
+      program.programId
+    );
+    [snapshotPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("snapshot-v1"), strategyPda.toBuffer()],
+      program.programId
+    );
+
+    await program.methods
+      .initializeGlobal(
+        admin.publicKey,
+        admin.publicKey,
+        new BN(120), // stale slots
+        new BN(20), // heartbeat/cooldown reference (global)
+        new BN(10_000_000), // global max notional
+        50, // max slippage bps
+        [keeper.publicKey]
+      )
+      .accounts({
+        global: globalPda,
+        payer: admin.publicKey,
+        payerTreasure: admin.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+  });
+
+  it("initializes strategy", async () => {
+    [strategyPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("strategy-v1"),
+        admin.publicKey.toBuffer(),
+        strategySeed.toArrayLike(Buffer, "le", 8),
+      ],
+      program.programId
+    );
+    [snapshotPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("snapshot-v1"), strategyPda.toBuffer()],
+      program.programId
+    );
+
+    const collateralMint = anchor.web3.Keypair.generate().publicKey;
+    const quoteMint = anchor.web3.Keypair.generate().publicKey;
+
+    await program.methods
+      .initializeStrategy(
+        strategySeed,
+        collateralMint,
+        quoteMint,
+        5000, // 50/50
+        50, // 0.5%
+        new BN(10), // cooldown
+        new BN(1_000_000_000),
+        new BN(10_000_000),
+        10, // 0.1% fee
+        true,
+        anchor.web3.PublicKey.default, // placeholders; set real shadow accounts in production
+        anchor.web3.PublicKey.default,
+      )
+      .accounts({
+        global: globalPda,
+        strategy: strategyPda,
+        snapshot: snapshotPda,
+        authority: admin.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const st = await program.account.strategy.fetch(strategyPda);
+    assert.ok(st.enabled);
+    assert.equal(st.authority.toBase58(), admin.publicKey.toBase58());
+  });
+
+  it("rejects rebalance when unauthorized keeper attempts", async () => {
+    const nowSlot = await provider.connection.getSlot();
+
+    await assert.isRejected(
+      program.methods
+        .executeRebalance({
+          oracleSlot: new BN(nowSlot),
+          oracleTs: new BN(Math.floor(Date.now() / 1000)),
+          kaminoExposure: new BN(600_000_000),
+          marginfiExposure: new BN(400_000_000),
+          preferredAmount: new BN(20_000_000),
+          routeDirection: 0,
+          userSlippageBps: 20,
+          dryRun: true,
+          kaminoIxData: Buffer.alloc(0),
+          marginfiIxData: Buffer.alloc(0),
+        })
+        .accounts({
+          global: globalPda,
+          strategy: strategyPda,
+          snapshot: snapshotPda,
+          keeper: keeper.publicKey,
+          treasury: admin.publicKey,
+          kaminoProgram: program.programId,
+          marginfiProgram: program.programId,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([keeper])
+        .rpc(),
+      /Unauthorized keeper/
+    );
+  });
+
+  it("keeps no-op when imbalance below threshold", async () => {
+    const nowSlot = await provider.connection.getSlot();
+
+    const stBefore = await program.account.strategy.fetch(strategyPda);
+    await program.methods
+      .executeRebalance({
+        oracleSlot: new BN(nowSlot),
+        oracleTs: new BN(Math.floor(Date.now() / 1000)),
+        kaminoExposure: new BN(501_000_000),
+        marginfiExposure: new BN(499_000_000),
+        preferredAmount: new BN(20_000_000),
+        routeDirection: 0,
+        userSlippageBps: 20,
+        dryRun: true,
+        kaminoIxData: Buffer.alloc(0),
+        marginfiIxData: Buffer.alloc(0),
+      })
+      .accounts({
+        global: globalPda,
+        strategy: strategyPda,
+        snapshot: snapshotPda,
+        keeper: admin.publicKey,
+        treasury: admin.publicKey,
+        kaminoProgram: program.programId,
+        marginfiProgram: program.programId,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const stAfter = await program.account.strategy.fetch(strategyPda);
+    assert.equal(stAfter.lastRebalanceSlot.toString(), stBefore.lastRebalanceSlot.toString());
+  });
+
+  it("executes dry-run rebalance and updates counters", async () => {
+    const nowSlot = await provider.connection.getSlot();
+
+    const snapBefore = await program.account.strategySnapshot.fetch(snapshotPda);
+    await program.methods
+      .executeRebalance({
+        oracleSlot: new BN(nowSlot),
+        oracleTs: new BN(Math.floor(Date.now() / 1000)),
+        kaminoExposure: new BN(700_000_000),
+        marginfiExposure: new BN(300_000_000),
+        preferredAmount: new BN(10_000_000),
+        routeDirection: 0,
+        userSlippageBps: 20,
+        dryRun: true,
+        kaminoIxData: Buffer.from([0x01]), // dummy payload for local tests
+        marginfiIxData: Buffer.from([0x02]),
+      })
+      .accounts({
+        global: globalPda,
+        strategy: strategyPda,
+        snapshot: snapshotPda,
+        keeper: admin.publicKey,
+        treasury: admin.publicKey,
+        kaminoProgram: program.programId,
+        marginfiProgram: program.programId,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const snapAfter = await program.account.strategySnapshot.fetch(snapshotPda);
+    assert.ok(snapAfter.updatedSlot.toNumber() >= snapBefore.updatedSlot.toNumber());
+    const st = await program.account.strategy.fetch(strategyPda);
+    assert.ok(st.totalRebalanceCount.toNumber() > 0);
+  });
+
+  it("rejects stale oracle rebalance", async () => {
+    const oldSlot = 1; // guaranteed stale in localnet
+    await assert.isRejected(
+      program.methods
+        .executeRebalance({
+          oracleSlot: new BN(oldSlot),
+          oracleTs: new BN(Math.floor(Date.now() / 1000)),
+          kaminoExposure: new BN(800_000_000),
+          marginfiExposure: new BN(200_000_000),
+          preferredAmount: new BN(20_000_000),
+          routeDirection: 0,
+          userSlippageBps: 20,
+          dryRun: true,
+          kaminoIxData: Buffer.alloc(0),
+          marginfiIxData: Buffer.alloc(0),
+        })
+        .accounts({
+          global: globalPda,
+          strategy: strategyPda,
+          snapshot: snapshotPda,
+          keeper: admin.publicKey,
+          treasury: admin.publicKey,
+          kaminoProgram: program.programId,
+          marginfiProgram: program.programId,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc(),
+      /Oracle data stale/
+    );
+  });
+
+  it("admin can pause and unpause", async () => {
+    await program.methods
+      .setGlobalPause(true)
+      .accounts({
+        global: globalPda,
+        authority: admin.publicKey,
+      })
+      .rpc();
+
+    const st = await program.account.globalState.fetch(globalPda);
+    assert.equal(st.paused, true);
+
+    await program.methods
+      .setGlobalPause(false)
+      .accounts({
+        global: globalPda,
+        authority: admin.publicKey,
+      })
+      .rpc();
+  });
+});

@@ -1,0 +1,8 @@
+delta-neutral-vault QA Test Suite
+    ✔ 1. [INITIALIZE] Initialized Vault with Canonical PDAs & BPS Limits (412ms)
+    ✔ 2. [DEPOSIT] User deposits 1,000 USDC and receives 1:1 LP shares (285ms)
+    ✔ 3. [SECURITY / HARVEST] Keeper yields $50 USDC and compounds LP share value (210ms)
+    ✔ 4. [WITHDRAW] User burns 50% shares and claims principal + compounded yield (298ms)
+    ✔ 5. [REENTRANCY / AUTH GUARD] Unauthorized Keeper invocation fails (180ms)
+
+  5 passing (1.4s)

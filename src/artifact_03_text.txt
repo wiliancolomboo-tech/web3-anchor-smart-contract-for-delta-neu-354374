@@ -1,0 +1,21 @@
+aegis_engine/
+├── Anchor.toml
+├── Cargo.toml
+├── programs/
+│   └── aegis_engine/
+│       ├── Cargo.toml
+│       └── src/
+│           ├── errors.rs
+│           ├── instructions/
+│           │   ├── deposit.rs
+│           │   ├── initialize.rs
+│           │   ├── mod.rs
+│           │   ├── rebalance.rs
+│           │   └── withdraw.rs
+│           ├── lib.rs
+│           ├── math.rs
+│           └── state.rs
+├── tests/
+│   └── delta_neutral_vault.spec.ts
+└── keeper/
+    └── keeper_bot.ts

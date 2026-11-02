@@ -1,0 +1,67 @@
+flowchart TD
+    %% Styling
+    classDef user fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC;
+    classDef router fill:#0F172A,stroke:#818CF8,stroke-width:3px,color:#F8FAFC;
+    classDef cpi fill:#312E81,stroke:#A78BFA,stroke-width:2px,color:#F8FAFC;
+    classDef keeper fill:#14532D,stroke:#4ADE80,stroke-width:2px,color:#F8FAFC;
+    classDef oracle fill:#701A75,stroke:#F472B6,stroke-width:2px,color:#F8FAFC;
+    classDef security fill:#7F1D1D,stroke:#F87171,stroke-width:2px,color:#F8FAFC;
+
+    subgraph ClientLayer ["Client & Automation Layer"]
+        U[User / Liquidity Provider]:::[user]
+        K[Off-Chain Keeper Bot]:::[keeper]
+    end
+
+    subgraph OracleLayer ["External Oracle Feeds"]
+        PYTH[Pyth / Switchboard Oracle Price Feeds]:::[oracle]
+    end
+
+    subgraph CoreRouter ["Delta-Neutral Yield Router (Anchor Program)"]
+        direction TB
+        AUTH{Signer & Health Verification}:::security
+        PDA_CFG[(Global Config PDA\n'config')]:::router
+        PDA_POS[(User Position PDA\n'position' + UserPubkey)]:::router
+        VAULT[(Vault Authority PDA\n'vault_authority')]:::router
+
+        subgraph GuardRails ["Security & Invariant Validation"]
+            REENT[Reentrancy Lock Check]:::security
+            LTV_CHK[LTV & Invariant Monitor]:::security
+            STALE[Oracle Staleness Guard < 30s]:::security
+        end
+    end
+
+    subgraph ExternalProtocols ["External Protocol Deployments (CPI Targets)"]
+        direction TB
+        subgraph MarginfiProtocol ["Marginfi Protocol"]
+            MF_BANK_USDC[(Marginfi USDC Bank)]:::cpi
+            MF_BANK_SOL[(Marginfi SOL Debt Bank)]:::cpi
+            MF_ACC[(Position Marginfi Account PDA)]:::cpi
+        end
+
+        subgraph KaminoProtocol ["Kamino Finance"]
+            KM_RESERVE[(Kamino SOL Reserve / Obligation)]:::cpi
+            KM_VAULT[(Kamino Farm / Vault Shares)]:::cpi
+        end
+    end
+
+    %% Flow connections
+    U -->|1. Deposit USDC & Open Strategy| AUTH
+    K -->|Trigger Keeper Crank| AUTH
+
+    AUTH --> REENT
+    REENT --> STALE
+    STALE --> PYTH
+    STALE --> PDA_CFG
+    PDA_CFG --> PDA_POS
+
+    PDA_POS -->|2. Supply USDC Collateral| MF_BANK_USDC
+    PDA_POS -->|3. Borrow SOL at LTV Target| MF_BANK_SOL
+    VAULT -->|4. Route Borrowed SOL CPI| KM_RESERVE
+    KM_RESERVE -->|5. Mint Receipt Shares / Tokens| KM_VAULT
+
+    KM_VAULT -.->|Tracked Delta Balance| LTV_CHK
+    MF_BANK_SOL -.->|Tracked Borrow Balance| LTV_CHK
+    LTV_CHK -->|Enforce Invariant Δ ≈ 0| PDA_POS
+
+    K -.->|Monitor Deviation Bands| PYTH
+    K -.->|Execute Dynamic Flash Rebalance| AUTH

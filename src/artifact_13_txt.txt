@@ -1,0 +1,15 @@
+┌───────────────────────────┬───────────────────────────────┬──────────────────────────────────────────┐
+│ Threat Vector             │ Risk Severity                 │ On-Chain Safeguard Implementation        │
+├───────────────────────────┼───────────────────────────────┼──────────────────────────────────────────┤
+│ Cross-Contract Reentrancy │ CRITICAL (CVSS 9.8)           │ State boolean flag `is_locked` toggled   │
+│                           │                               │ atomically at entry and exit boundaries. │
+├───────────────────────────┼───────────────────────────────┼──────────────────────────────────────────┤
+│ Oracle Arbitrage/Frontrun │ HIGH (CVSS 8.2)               │ Pyth confidence interval check:          │
+│                           │                               │ `conf < 0.01 * price` & staleness < 30s. │
+├───────────────────────────┼───────────────────────────────┼──────────────────────────────────────────┤
+│ Fake Account Injection    │ HIGH (CVSS 8.5)               │ Seed-constrained PDAs for authority and  │
+│                           │                               │ vaults; strict `has_one` mint assertions.│
+├───────────────────────────┼───────────────────────────────┼──────────────────────────────────────────┤
+│ Delta Drift Liquidation   │ MEDIUM (CVSS 6.5)             │ Keeper threshold enforcement with keeper │
+│                           │                               │ authority signature whitelist.           │
+└───────────────────────────┴───────────────────────────────┴──────────────────────────────────────────┘
