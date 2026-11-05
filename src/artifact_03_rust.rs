@@ -1,290 +1,273 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-use pyth_sdk_solana::load_price_feed_from_account_info;
 
-declare_id!("NeutrAY1eLdRouter11111111111111111111111111");
+declare_id!("AURAdnr7j8MvY2sE2CjS9rZ57oU8kGkQ3gZ7Y2r1aVR");
 
-pub const BPS_DIVISOR: u64 = 10_000;
-pub const MAX_DELTA_TOLERANCE_BPS: u64 = 200; // 2.0% Delta imbalance threshold
-pub const MAX_SAFE_LTV_BPS: u64 = 6_500;       // 65.0% LTV borrow limit
-pub const PYTH_MAX_AGE_SECS: u64 = 60;
-pub const ORACLE_CONFIDENCE_FACTOR: u64 = 100; // Confidence must be within 1% of price
+pub const BPS_DENOMINATOR: u64 = 10_000;
+pub const MAX_LEVERAGE_BPS: u64 = 30_000; // 3.0x Max Leverage
+pub const MAX_DELTA_TOLERANCE_BPS: u64 = 250; // 2.5% Delta tolerance
+pub const ORACLE_EXPIRY_THRESHOLD_SECS: i64 = 60;
 
 #[program]
-pub mod neutra_yield {
+pub mod delta_neutral_router {
     use super::*;
 
-    /// Initializes a new Delta-Neutral Strategy Vault with associated PDAs and configuration
+    /// Initializes the Master Vault for a designated underlying pair (e.g., SOL-USDC).
     pub fn initialize_vault(
         ctx: Context<InitializeVault>,
-        vault_id: u64,
-        target_ltv_bps: u64,
+        strategy_id: u64,
+        target_delta_bps: i64,
         rebalance_threshold_bps: u64,
     ) -> Result<()> {
-        require!(target_ltv_bps <= MAX_SAFE_LTV_BPS, ErrorCode::UnsafeLtvConfig);
-        require!(rebalance_threshold_bps <= MAX_DELTA_TOLERANCE_BPS, ErrorCode::InvalidDeltaThreshold);
-
-        let vault = &mut ctx.accounts.vault;
-        vault.bump = ctx.bumps.vault;
-        vault.authority_bump = ctx.bumps.vault_authority;
-        vault.vault_id = vault_id;
-        vault.admin = ctx.accounts.admin.key();
-        vault.base_mint = ctx.accounts.base_mint.key();         // e.g. USDC
-        vault.target_asset_mint = ctx.accounts.target_mint.key();// e.g. SOL or JitoSOL
-        vault.total_shares = 0;
-        vault.total_underlying_assets = 0;
-        vault.target_ltv_bps = target_ltv_bps;
-        vault.rebalance_threshold_bps = rebalance_threshold_bps;
-        vault.reentrancy_locked = false;
-        vault.paused = false;
-
-        msg!("Initialized Delta-Neutral Vault ID: {}", vault_id);
-        Ok(())
-    }
-
-    /// Deposits base token (USDC), splits capital, routes long leg to Kamino, short leg to Marginfi
-    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(!vault.paused, ErrorCode::ProtocolPaused);
-        require!(!vault.reentrancy_locked, ErrorCode::ReentrancyDetected);
-        vault.reentrancy_locked = true;
-
-        require!(amount > 0, ErrorCode::ZeroDepositAmount);
-
-        // 1. Verify Price Feeds from Pyth Core
-        let target_price_usd = get_pyth_price(
-            &ctx.accounts.target_oracle,
-            Clock::get()?.unix_timestamp,
-        )?;
-
-        // 2. Transfer base tokens into Vault's holding account
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.user_base_token.to_account_info(),
-            to: ctx.accounts.vault_base_token.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
-
-        // 3. Compute Shares to Mint (ERC-4626 standard: assets * total_shares / total_assets)
-        let shares_to_mint = if vault.total_shares == 0 || vault.total_underlying_assets == 0 {
-            amount
-        } else {
-            (amount as u128)
-                .checked_mul(vault.total_shares as u128)
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(vault.total_underlying_assets as u128)
-                .ok_or(ErrorCode::MathOverflow)? as u64
-        };
-
-        // 4. Split Capital: 50% to Kamino (Long Spot), 50% to Marginfi (Short Hedge Collateral)
-        let half_capital = amount.checked_div(2).ok_or(ErrorCode::MathOverflow)?;
-
-        // Execute CPI to Marginfi: Supply Collateral (USDC)
-        execute_marginfi_deposit_cpi(
-            &ctx.accounts.marginfi_program,
-            &ctx.accounts.vault_authority,
-            &ctx.accounts.marginfi_group,
-            &ctx.accounts.marginfi_account,
-            &ctx.accounts.vault_base_token,
-            &ctx.accounts.marginfi_bank,
-            &ctx.accounts.token_program,
-            vault.bump,
-            vault.vault_id,
-            half_capital,
-        )?;
-
-        // 5. Update user and vault ledger states
-        let user_position = &mut ctx.accounts.user_position;
-        if user_position.shares == 0 {
-            user_position.owner = ctx.accounts.user.key();
-            user_position.vault = vault.key();
-            user_position.bump = ctx.bumps.user_position;
-        }
-
-        user_position.shares = user_position
-            .shares
-            .checked_add(shares_to_mint)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        vault.total_shares = vault
-            .total_shares
-            .checked_add(shares_to_mint)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        vault.total_underlying_assets = vault
-            .total_underlying_assets
-            .checked_add(amount)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        vault.reentrancy_locked = false;
-
-        emit!(DepositEvent {
-            user: ctx.accounts.user.key(),
-            amount,
-            shares_minted: shares_to_mint,
-            oracle_price: target_price_usd,
-        });
-
-        Ok(())
-    }
-
-    /// Keeper routine: Rebalances delta exposure if deviation exceeds allowed threshold
-    pub fn rebalance(ctx: Context<Rebalance>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(!vault.paused, ErrorCode::ProtocolPaused);
-        require!(!vault.reentrancy_locked, ErrorCode::ReentrancyDetected);
-        vault.reentrancy_locked = true;
-
-        // 1. Fetch live oracles
-        let spot_price = get_pyth_price(
-            &ctx.accounts.target_oracle,
-            Clock::get()?.unix_timestamp,
-        )?;
-
-        // 2. Fetch position sizes across Kamino (Long) and Marginfi (Short)
-        // For production, these values are unpacked directly from deserialized protocol reserve accounts
-        let kamino_long_value_usd = get_kamino_collateral_usd(&ctx.accounts.kamino_obligation, spot_price)?;
-        let marginfi_short_value_usd = get_marginfi_borrow_usd(&ctx.accounts.marginfi_account, spot_price)?;
-
-        // 3. Compute Delta Imbalance: (Long - Short) / (Long + Short)
-        let total_exposure = kamino_long_value_usd
-            .checked_add(marginfi_short_value_usd)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        require!(total_exposure > 0, ErrorCode::ZeroExposure);
-
-        let delta_imbalance = if kamino_long_value_usd >= marginfi_short_value_usd {
-            kamino_long_value_usd - marginfi_short_value_usd
-        } else {
-            marginfi_short_value_usd - kamino_long_value_usd
-        };
-
-        let delta_imbalance_bps = (delta_imbalance as u128)
-            .checked_mul(BPS_DIVISOR as u128)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(total_exposure as u128)
-            .ok_or(ErrorCode::MathOverflow)? as u64;
-
-        // Ensure keeper can only execute if the threshold is violated
         require!(
-            delta_imbalance_bps >= vault.rebalance_threshold_bps,
-            ErrorCode::DeltaWithinTolerance
+            rebalance_threshold_bps <= MAX_DELTA_TOLERANCE_BPS,
+            RouterError::ExcessiveDeltaThreshold
         );
 
-        // 4. Adjust Position via CPI to restore Delta Neutrality
-        // Executes Marginfi borrow/repay or Kamino deposit/withdraw depending on skew direction
-        msg!(
-            "Executing rebalance: Skew = {} bps, Threshold = {} bps",
-            delta_imbalance_bps,
-            vault.rebalance_threshold_bps
-        );
+        let vault = &mut ctx.accounts.vault_state;
+        vault.authority = ctx.accounts.authority.key();
+        vault.keeper = ctx.accounts.keeper.key();
+        vault.base_mint = ctx.accounts.base_mint.key();
+        vault.quote_mint = ctx.accounts.quote_mint.key();
+        vault.shares_mint = ctx.accounts.shares_mint.key();
+        vault.vault_base_ata = ctx.accounts.vault_base_ata.key();
+        vault.vault_quote_ata = ctx.accounts.vault_quote_ata.key();
+        
+        vault.strategy_id = strategy_id;
+        vault.target_delta_bps = target_delta_bps;
+        vault.rebalance_threshold_bps = rebalance_threshold_bps;
+        vault.total_vault_shares = 0;
+        vault.is_paused = false;
+        vault.bump = ctx.bumps.vault_state;
 
-        vault.reentrancy_locked = false;
-
-        emit!(RebalanceEvent {
-            executor: ctx.accounts.keeper.key(),
-            imbalance_bps: delta_imbalance_bps,
+        emit!(VaultInitializedEvent {
+            vault: vault.key(),
+            authority: vault.authority,
+            strategy_id,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
         Ok(())
     }
 
-    /// Redeems strategy shares for underlying collateral proportionally
-    pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-        require!(!vault.reentrancy_locked, ErrorCode::ReentrancyDetected);
-        vault.reentrancy_locked = true;
+    /// Deposits Quote Assets (e.g. USDC), issuing Vault Shares 1:1 or net-asset-value-proportional.
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault_state;
+        require!(!vault.is_paused, RouterError::ProtocolPaused);
+        require!(amount > 0, RouterError::ZeroDepositAmount);
 
-        let user_position = &mut ctx.accounts.user_position;
-        require!(user_position.shares >= shares, ErrorCode::InsufficientShares);
-        require!(shares > 0, ErrorCode::ZeroWithdrawAmount);
+        let total_shares = vault.total_vault_shares;
+        let total_assets = ctx.accounts.vault_quote_ata.amount;
 
-        // Assets = (shares * total_underlying_assets) / total_shares
-        let gross_assets = (shares as u128)
-            .checked_mul(vault.total_underlying_assets as u128)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(vault.total_shares as u128)
-            .ok_or(ErrorCode::MathOverflow)? as u64;
-
-        // Decrement states
-        user_position.shares = user_position.shares.checked_sub(shares).ok_or(ErrorCode::MathOverflow)?;
-        vault.total_shares = vault.total_shares.checked_sub(shares).ok_or(ErrorCode::MathOverflow)?;
-        vault.total_underlying_assets = vault.total_underlying_assets.checked_sub(gross_assets).ok_or(ErrorCode::MathOverflow)?;
-
-        // Transfer funds back to user from PDA reserves
-        let seeds = &[
-            b"authority".as_ref(),
-            vault.to_account_info().key.as_ref(),
-            &[vault.authority_bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_base_token.to_account_info(),
-            to: ctx.accounts.user_base_token.to_account_info(),
-            authority: ctx.accounts.vault_authority.to_account_info(),
+        let shares_to_mint = if total_shares == 0 || total_assets == 0 {
+            amount
+        } else {
+            (amount as u128)
+                .checked_mul(total_shares as u128)
+                .ok_or(RouterError::MathOverflow)?
+                .checked_div(total_assets as u128)
+                .ok_or(RouterError::MathOverflow)? as u64
         };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer,
-        );
-        token::transfer(cpi_ctx, gross_assets)?;
 
-        vault.reentrancy_locked = false;
+        // Transfer quote collateral from user to vault
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.user_quote_ata.to_account_info(),
+                    to: ctx.accounts.vault_quote_ata.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
 
-        emit!(WithdrawEvent {
+        // Mint liquidity receipt shares to depositor
+        let strategy_id_bytes = vault.strategy_id.to_le_bytes();
+        let seeds = &[
+            b"vault_state".as_ref(),
+            strategy_id_bytes.as_ref(),
+            &[vault.bump],
+        ];
+        let signer_seeds = &[&seeds[..]];
+
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::MintTo {
+                    mint: ctx.accounts.shares_mint.to_account_info(),
+                    to: ctx.accounts.user_shares_ata.to_account_info(),
+                    authority: vault.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            shares_to_mint,
+        )?;
+
+        vault.total_vault_shares = vault
+            .total_vault_shares
+            .checked_add(shares_to_mint)
+            .ok_or(RouterError::MathOverflow)?;
+
+        emit!(DepositEvent {
             user: ctx.accounts.user.key(),
-            shares_burned: shares,
-            assets_returned: gross_assets,
+            amount,
+            shares_issued: shares_to_mint,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    /// Rebalances Kamino Long and Marginfi Short hedges to retain neutral portfolio delta.
+    pub fn rebalance_delta_neutral(
+        ctx: Context<RebalanceDeltaNeutral>,
+        kamino_allocation: u64,
+        marginfi_borrow_target: u64,
+        max_base_price_slippage: u64,
+        min_base_price_slippage: u64,
+    ) -> Result<()> {
+        let vault = &mut ctx.accounts.vault_state;
+        require!(!vault.is_paused, RouterError::ProtocolPaused);
+        require!(
+            ctx.accounts.caller.key() == vault.keeper || ctx.accounts.caller.key() == vault.authority,
+            RouterError::UnauthorizedKeeper
+        );
+
+        // Parse Pyth Network price account securely
+        let oracle_price = ctx.accounts.pyth_oracle_feed.to_account_info();
+        let oracle_data = oracle_price.try_borrow_data()?;
+        let current_price = parse_pyth_price(&oracle_data, Clock::get()?.unix_timestamp)?;
+
+        require!(
+            current_price >= min_base_price_slippage && current_price <= max_base_price_slippage,
+            RouterError::PriceSlippageExceeded
+        );
+
+        let strategy_id_bytes = vault.strategy_id.to_le_bytes();
+        let seeds = &[
+            b"vault_state".as_ref(),
+            strategy_id_bytes.as_ref(),
+            &[vault.bump],
+        ];
+        let signer_seeds = &[&seeds[..]];
+
+        // --- STEP 1: Supply capital into Kamino to generate long yield ---
+        if kamino_allocation > 0 {
+            let kamino_cpi_accounts = KaminoDepositAccounts {
+                lending_market: ctx.accounts.kamino_lending_market.to_account_info(),
+                reserve: ctx.accounts.kamino_reserve.to_account_info(),
+                reserve_liquidity_supply: ctx.accounts.kamino_reserve_supply.to_account_info(),
+                user_source_liquidity: ctx.accounts.vault_quote_ata.to_account_info(),
+                user_destination_collateral: ctx.accounts.vault_kamino_collateral.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                vault_signer: vault.to_account_info(),
+            };
+            kamino_deposit_cpi(kamino_cpi_accounts, kamino_allocation, signer_seeds)?;
+        }
+
+        // --- STEP 2: Borrow base token from Marginfi to synthetically short & offset delta ---
+        if marginfi_borrow_target > 0 {
+            let marginfi_cpi_accounts = MarginfiBorrowAccounts {
+                marginfi_group: ctx.accounts.marginfi_group.to_account_info(),
+                marginfi_account: ctx.accounts.marginfi_account.to_account_info(),
+                marginfi_bank: ctx.accounts.marginfi_bank.to_account_info(),
+                destination_token_account: ctx.accounts.vault_base_ata.to_account_info(),
+                bank_liquidity_vault: ctx.accounts.marginfi_bank_vault.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                vault_signer: vault.to_account_info(),
+            };
+            marginfi_borrow_cpi(marginfi_cpi_accounts, marginfi_borrow_target, signer_seeds)?;
+        }
+
+        // Update strategy position state
+        let pos = &mut ctx.accounts.strategy_position;
+        pos.kamino_supplied_amount = kamino_allocation;
+        pos.marginfi_borrowed_amount = marginfi_borrow_target;
+        pos.last_oracle_price = current_price;
+        pos.last_rebalance_slot = Clock::get()?.slot;
+
+        emit!(RebalancedEvent {
+            vault: vault.key(),
+            kamino_supplied: kamino_allocation,
+            marginfi_borrowed: marginfi_borrow_target,
+            oracle_price: current_price,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    /// Emergency shutdown toggle to protect depositor principal
+    pub fn set_emergency_pause(ctx: Context<ManageVault>, pause: bool) -> Result<()> {
+        let vault = &mut ctx.accounts.vault_state;
+        vault.is_paused = pause;
+
+        emit!(EmergencyHaltEvent {
+            vault: vault.key(),
+            is_paused: pause,
+            timestamp: Clock::get()?.unix_timestamp,
         });
 
         Ok(())
     }
 }
 
-// -------------------------------------------------------------------------------------------------
-// Account Layouts & Contexts
-// -------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// ACCOUNT VALIDATION CONTEXTS
+// -----------------------------------------------------------------------------
 
 #[derive(Accounts)]
-#[instruction(vault_id: u64)]
+#[instruction(strategy_id: u64)]
 pub struct InitializeVault<'info> {
     #[account(
         init,
-        payer = admin,
-        space = 8 + VaultState::LEN,
-        seeds = [b"vault", vault_id.to_le_bytes().as_ref()],
+        payer = authority,
+        space = 8 + VaultState::INIT_SPACE,
+        seeds = [b"vault_state", strategy_id.to_le_bytes().as_ref()],
         bump
     )]
-    pub vault: Box<Account<'info, VaultState>>,
-
-    /// CHECK: Seeds-checked vault authority PDA used as signers for CPI and token transfer
-    #[account(
-        seeds = [b"authority", vault.key().as_ref()],
-        bump
-    )]
-    pub vault_authority: AccountInfo<'info>,
+    pub vault_state: Box<Account<'info, VaultState>>,
 
     pub base_mint: Box<Account<'info, Mint>>,
-    pub target_mint: Box<Account<'info, Mint>>,
+    pub quote_mint: Box<Account<'info, Mint>>,
 
     #[account(
         init,
-        payer = admin,
-        token::mint = base_mint,
-        token::authority = vault_authority,
-        seeds = [b"vault_token", vault.key().as_ref()],
+        payer = authority,
+        mint::decimals = 6,
+        mint::authority = vault_state,
+        seeds = [b"shares_mint", vault_state.key().as_ref()],
         bump
     )]
-    pub vault_base_token: Box<Account<'info, TokenAccount>>,
+    pub shares_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        init,
+        payer = authority,
+        associated_token::mint = base_mint,
+        associated_token::authority = vault_state
+    )]
+    pub vault_base_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init,
+        payer = authority,
+        associated_token::mint = quote_mint,
+        associated_token::authority = vault_state
+    )]
+    pub vault_quote_ata: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Designate keeper bot signer pubkey
+    pub keeper: UncheckedAccount<'info>,
 
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub authority: Signer<'info>,
+
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub rent: Sysvar<'info, Rent>,
 }
 
@@ -292,318 +275,343 @@ pub struct InitializeVault<'info> {
 pub struct Deposit<'info> {
     #[account(
         mut,
-        seeds = [b"vault", vault.vault_id.to_le_bytes().as_ref()],
-        bump = vault.bump,
+        seeds = [b"vault_state", vault_state.strategy_id.to_le_bytes().as_ref()],
+        bump = vault_state.bump
     )]
-    pub vault: Box<Account<'info, VaultState>>,
+    pub vault_state: Box<Account<'info, VaultState>>,
 
-    /// CHECK: PDA signer for CPI
     #[account(
-        seeds = [b"authority", vault.key().as_ref()],
-        bump = vault.authority_bump
+        mut,
+        seeds = [b"shares_mint", vault_state.key().as_ref()],
+        bump
     )]
-    pub vault_authority: AccountInfo<'info>,
+    pub shares_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        mut,
+        associated_token::mint = vault_state.quote_mint,
+        associated_token::authority = vault_state
+    )]
+    pub vault_quote_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::mint = vault_state.quote_mint,
+        associated_token::authority = user
+    )]
+    pub user_quote_ata: Box<Account<'info, TokenAccount>>,
 
     #[account(
         init_if_needed,
         payer = user,
-        space = 8 + UserPosition::LEN,
-        seeds = [b"user_position", vault.key().as_ref(), user.key().as_ref()],
-        bump
+        associated_token::mint = shares_mint,
+        associated_token::authority = user
     )]
-    pub user_position: Box<Account<'info, UserPosition>>,
-
-    #[account(mut)]
-    pub user_base_token: Box<Account<'info, TokenAccount>>,
-
-    #[account(
-        mut,
-        seeds = [b"vault_token", vault.key().as_ref()],
-        bump
-    )]
-    pub vault_base_token: Box<Account<'info, TokenAccount>>,
-
-    /// CHECK: Pyth Price Oracle Account for asset valuation
-    pub target_oracle: AccountInfo<'info>,
-
-    // External Protocol CPI Accounts
-    /// CHECK: Marginfi Program
-    pub marginfi_program: AccountInfo<'info>,
-    /// CHECK: Marginfi Group Account
-    #[account(mut)]
-    pub marginfi_group: AccountInfo<'info>,
-    /// CHECK: Marginfi Margin Account PDA of this Vault
-    #[account(mut)]
-    pub marginfi_account: AccountInfo<'info>,
-    /// CHECK: Marginfi Bank Account
-    #[account(mut)]
-    pub marginfi_bank: AccountInfo<'info>,
+    pub user_shares_ata: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
-pub struct Rebalance<'info> {
+pub struct RebalanceDeltaNeutral<'info> {
     #[account(
         mut,
-        seeds = [b"vault", vault.vault_id.to_le_bytes().as_ref()],
-        bump = vault.bump
+        seeds = [b"vault_state", vault_state.strategy_id.to_le_bytes().as_ref()],
+        bump = vault_state.bump
     )]
-    pub vault: Box<Account<'info, VaultState>>,
-
-    /// CHECK: PDA signer
-    #[account(
-        seeds = [b"authority", vault.key().as_ref()],
-        bump = vault.authority_bump
-    )]
-    pub vault_authority: AccountInfo<'info>,
-
-    /// CHECK: Kamino Obligation Account
-    pub kamino_obligation: AccountInfo<'info>,
-    /// CHECK: Marginfi Margin Account
-    pub marginfi_account: AccountInfo<'info>,
-    /// CHECK: Target Pyth Oracle
-    pub target_oracle: AccountInfo<'info>,
-
-    pub keeper: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct Withdraw<'info> {
-    #[account(
-        mut,
-        seeds = [b"vault", vault.vault_id.to_le_bytes().as_ref()],
-        bump = vault.bump
-    )]
-    pub vault: Box<Account<'info, VaultState>>,
-
-    /// CHECK: PDA signer
-    #[account(
-        seeds = [b"authority", vault.key().as_ref()],
-        bump = vault.authority_bump
-    )]
-    pub vault_authority: AccountInfo<'info>,
+    pub vault_state: Box<Account<'info, VaultState>>,
 
     #[account(
-        mut,
-        seeds = [b"user_position", vault.key().as_ref(), user.key().as_ref()],
-        bump = user_position.bump,
-        has_one = owner,
-        has_one = vault,
-    )]
-    pub user_position: Box<Account<'info, UserPosition>>,
-
-    #[account(
-        mut,
-        seeds = [b"vault_token", vault.key().as_ref()],
+        init_if_needed,
+        payer = caller,
+        space = 8 + StrategyPosition::INIT_SPACE,
+        seeds = [b"strategy_position", vault_state.key().as_ref()],
         bump
     )]
-    pub vault_base_token: Box<Account<'info, TokenAccount>>,
+    pub strategy_position: Box<Account<'info, StrategyPosition>>,
 
-    #[account(mut)]
-    pub user_base_token: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = vault_state.quote_mint,
+        associated_token::authority = vault_state
+    )]
+    pub vault_quote_ata: Box<Account<'info, TokenAccount>>,
 
+    #[account(
+        mut,
+        associated_token::mint = vault_state.base_mint,
+        associated_token::authority = vault_state
+    )]
+    pub vault_base_ata: Box<Account<'info, TokenAccount>>,
+
+    /// Pyth Network Pull or Push Price Account
+    /// CHECK: Validated inside `parse_pyth_price`
+    pub pyth_oracle_feed: UncheckedAccount<'info>,
+
+    // Kamino Specific Accounts
+    /// CHECK: External protocol lending market
+    pub kamino_lending_market: UncheckedAccount<'info>,
+    /// CHECK: External protocol reserve
     #[account(mut)]
-    pub owner: Signer<'info>,
+    pub kamino_reserve: UncheckedAccount<'info>,
+    /// CHECK: Supply vault
+    #[account(mut)]
+    pub kamino_reserve_supply: UncheckedAccount<'info>,
+    /// CHECK: Vault collateral account receiving Kamino cTokens
+    #[account(mut)]
+    pub vault_kamino_collateral: UncheckedAccount<'info>,
+
+    // Marginfi Specific Accounts
+    /// CHECK: Marginfi verification group
+    pub marginfi_group: UncheckedAccount<'info>,
+    /// CHECK: Marginfi user margin account PDA
+    #[account(mut)]
+    pub marginfi_account: UncheckedAccount<'info>,
+    /// CHECK: Marginfi Bank account for Base token
+    #[account(mut)]
+    pub marginfi_bank: UncheckedAccount<'info>,
+    /// CHECK: Marginfi Bank Liquidity Vault
+    #[account(mut)]
+    pub marginfi_bank_vault: UncheckedAccount<'info>,
+
+    pub caller: Signer<'info>,
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
-// -------------------------------------------------------------------------------------------------
-// State Definitions
-// -------------------------------------------------------------------------------------------------
+#[derive(Accounts)]
+pub struct ManageVault<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault_state", vault_state.strategy_id.to_le_bytes().as_ref()],
+        bump = vault_state.bump,
+        has_one = authority @ RouterError::UnauthorizedAdmin
+    )]
+    pub vault_state: Box<Account<'info, VaultState>>,
+    pub authority: Signer<'info>,
+}
+
+// -----------------------------------------------------------------------------
+// STATE SCHEMAS
+// -----------------------------------------------------------------------------
 
 #[account]
+#[derive(InitSpace)]
 pub struct VaultState {
-    pub bump: u8,
-    pub authority_bump: u8,
-    pub vault_id: u64,
-    pub admin: Pubkey,
+    pub authority: Pubkey,
+    pub keeper: Pubkey,
     pub base_mint: Pubkey,
-    pub target_asset_mint: Pubkey,
-    pub total_shares: u64,
-    pub total_underlying_assets: u64,
-    pub target_ltv_bps: u64,
+    pub quote_mint: Pubkey,
+    pub shares_mint: Pubkey,
+    pub vault_base_ata: Pubkey,
+    pub vault_quote_ata: Pubkey,
+    pub strategy_id: u64,
+    pub target_delta_bps: i64,
     pub rebalance_threshold_bps: u64,
-    pub reentrancy_locked: bool,
-    pub paused: bool,
-}
-
-impl VaultState {
-    pub const LEN: usize = 1 + 1 + 8 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 1 + 1;
+    pub total_vault_shares: u64,
+    pub is_paused: bool,
+    pub bump: u8,
 }
 
 #[account]
-pub struct UserPosition {
-    pub owner: Pubkey,
-    pub vault: Pubkey,
-    pub shares: u64,
-    pub bump: u8,
+#[derive(InitSpace)]
+pub struct StrategyPosition {
+    pub kamino_supplied_amount: u64,
+    pub marginfi_borrowed_amount: u64,
+    pub last_oracle_price: u64,
+    pub last_rebalance_slot: u64,
 }
 
-impl UserPosition {
-    pub const LEN: usize = 32 + 32 + 8 + 1;
+// -----------------------------------------------------------------------------
+// CROSS-PROGRAM INVOCATION WRAPPERS
+// -----------------------------------------------------------------------------
+
+pub struct KaminoDepositAccounts<'info> {
+    pub lending_market: AccountInfo<'info>,
+    pub reserve: AccountInfo<'info>,
+    pub reserve_liquidity_supply: AccountInfo<'info>,
+    pub user_source_liquidity: AccountInfo<'info>,
+    pub user_destination_collateral: AccountInfo<'info>,
+    pub token_program: AccountInfo<'info>,
+    pub vault_signer: AccountInfo<'info>,
 }
 
-// -------------------------------------------------------------------------------------------------
-// Helpers & Cross-Program Invocations (CPI)
-// -------------------------------------------------------------------------------------------------
-
-pub fn get_pyth_price(oracle_info: &AccountInfo, current_timestamp: i64) -> Result<u64> {
-    let price_feed = load_price_feed_from_account_info(oracle_info)
-        .map_err(|_| ErrorCode::InvalidOracleAccount)?;
-    let price_data = price_feed
-        .get_price_no_older_than(current_timestamp, PYTH_MAX_AGE_SECS)
-        .ok_or(ErrorCode::StaleOraclePrice)?;
-
-    require!(price_data.price > 0, ErrorCode::InvalidOraclePrice);
-
-    // Assert Pyth confidence interval is within safe boundaries (< 1%)
-    let conf_spread = (price_data.conf as u128)
-        .checked_mul(ORACLE_CONFIDENCE_FACTOR as u128)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(price_data.price as u128)
-        .ok_or(ErrorCode::MathOverflow)? as u64;
-
-    require!(conf_spread <= 1, ErrorCode::OracleConfidenceBreached);
-
-    Ok(price_data.price as u64)
-}
-
-pub fn execute_marginfi_deposit_cpi<'info>(
-    marginfi_program: &AccountInfo<'info>,
-    vault_authority: &AccountInfo<'info>,
-    marginfi_group: &AccountInfo<'info>,
-    marginfi_account: &AccountInfo<'info>,
-    vault_base_token: &AccountInfo<'info>,
-    marginfi_bank: &AccountInfo<'info>,
-    token_program: &AccountInfo<'info>,
-    vault_bump: u8,
-    vault_id: u64,
+pub fn kamino_deposit_cpi<'info>(
+    accounts: KaminoDepositAccounts<'info>,
     amount: u64,
+    signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
-    // Instruction discriminator for Marginfi v2 LendingPoolDeposit
-    let mut data = vec![0xda, 0x14, 0x3d, 0x36, 0x5e, 0x3b, 0x5a, 0x48];
+    // Instruction discriminator for Kamino deposit reserve liquidity
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&[242, 35, 198, 137, 82, 225, 242, 182]); // DepositReserveLiquidity discriminator
     data.extend_from_slice(&amount.to_le_bytes());
 
-    let accounts = vec![
-        AccountMeta::new_readonly(marginfi_group.key(), false),
-        AccountMeta::new(marginfi_account.key(), false),
-        AccountMeta::new_readonly(vault_authority.key(), true),
-        AccountMeta::new(marginfi_bank.key(), false),
-        AccountMeta::new(vault_base_token.key(), false),
-        AccountMeta::new_readonly(token_program.key(), false),
-    ];
-
-    let ix = anchor_lang::solana_program::instruction::Instruction {
-        program_id: marginfi_program.key(),
-        accounts,
+    let instruction = anchor_lang::solana_program::instruction::Instruction {
+        program_id: *accounts.lending_market.owner,
+        accounts: vec![
+            AccountMeta::new(accounts.user_source_liquidity.key(), false),
+            AccountMeta::new(accounts.user_destination_collateral.key(), false),
+            AccountMeta::new(accounts.reserve.key(), false),
+            AccountMeta::new(accounts.reserve_liquidity_supply.key(), false),
+            AccountMeta::new_readonly(accounts.lending_market.key(), false),
+            AccountMeta::new_readonly(accounts.vault_signer.key(), true),
+            AccountMeta::new_readonly(accounts.token_program.key(), false),
+        ],
         data,
     };
 
-    let id_bytes = vault_id.to_le_bytes();
-    let seeds = &[
-        b"vault".as_ref(),
-        id_bytes.as_ref(),
-        &[vault_bump],
-    ];
-
     anchor_lang::solana_program::program::invoke_signed(
-        &ix,
+        &instruction,
         &[
-            marginfi_group.clone(),
-            marginfi_account.clone(),
-            vault_authority.clone(),
-            marginfi_bank.clone(),
-            vault_base_token.clone(),
-            token_program.clone(),
+            accounts.user_source_liquidity,
+            accounts.user_destination_collateral,
+            accounts.reserve,
+            accounts.reserve_liquidity_supply,
+            accounts.lending_market,
+            accounts.vault_signer,
+            accounts.token_program,
         ],
-        &[&seeds[..]],
+        signer_seeds,
     )?;
 
     Ok(())
 }
 
-pub fn get_kamino_collateral_usd(_obligation: &AccountInfo, price: u64) -> Result<u64> {
-    // Simulates reading collateral balances from Kamino Reserve layout
-    // In production, uses Kamino SDK obligation parser: Obligation::deserialize(&mut &data[..])
-    let simulated_collateral_units: u64 = 1_000_000_000; // 1.0 JitoSOL (9 decimals)
-    let val = (simulated_collateral_units as u128)
-        .checked_mul(price as u128)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(1_000_000_000)
-        .ok_or(ErrorCode::MathOverflow)? as u64;
-    Ok(val)
+pub struct MarginfiBorrowAccounts<'info> {
+    pub marginfi_group: AccountInfo<'info>,
+    pub marginfi_account: AccountInfo<'info>,
+    pub marginfi_bank: AccountInfo<'info>,
+    pub destination_token_account: AccountInfo<'info>,
+    pub bank_liquidity_vault: AccountInfo<'info>,
+    pub token_program: AccountInfo<'info>,
+    pub vault_signer: AccountInfo<'info>,
 }
 
-pub fn get_marginfi_borrow_usd(_marginfi_account: &AccountInfo, price: u64) -> Result<u64> {
-    // Simulates reading borrow liability from Marginfi account layout
-    let simulated_borrow_units: u64 = 980_000_000; // 0.98 SOL (9 decimals)
-    let val = (simulated_borrow_units as u128)
-        .checked_mul(price as u128)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(1_000_000_000)
-        .ok_or(ErrorCode::MathOverflow)? as u64;
-    Ok(val)
+pub fn marginfi_borrow_cpi<'info>(
+    accounts: MarginfiBorrowAccounts<'info>,
+    amount: u64,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    // Instruction discriminator for Marginfi account borrow
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&[41, 237, 233, 40, 115, 203, 15, 172]); // Marginfi AccountBorrow discriminator
+    data.extend_from_slice(&amount.to_le_bytes());
+
+    let instruction = anchor_lang::solana_program::instruction::Instruction {
+        program_id: *accounts.marginfi_group.owner,
+        accounts: vec![
+            AccountMeta::new_readonly(accounts.marginfi_group.key(), false),
+            AccountMeta::new(accounts.marginfi_account.key(), false),
+            AccountMeta::new_readonly(accounts.vault_signer.key(), true),
+            AccountMeta::new(accounts.marginfi_bank.key(), false),
+            AccountMeta::new(accounts.destination_token_account.key(), false),
+            AccountMeta::new(accounts.bank_liquidity_vault.key(), false),
+            AccountMeta::new_readonly(accounts.token_program.key(), false),
+        ],
+        data,
+    };
+
+    anchor_lang::solana_program::program::invoke_signed(
+        &instruction,
+        &[
+            accounts.marginfi_group,
+            accounts.marginfi_account,
+            accounts.vault_signer,
+            accounts.marginfi_bank,
+            accounts.destination_token_account,
+            accounts.bank_liquidity_vault,
+            accounts.token_program,
+        ],
+        signer_seeds,
+    )?;
+
+    Ok(())
 }
 
-// -------------------------------------------------------------------------------------------------
-// Events & Errors
-// -------------------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// ORACLE VALIDATION HELPERS
+// -----------------------------------------------------------------------------
+
+pub fn parse_pyth_price(data: &[u8], current_timestamp: i64) -> Result<u64> {
+    require!(data.len() >= 64, RouterError::InvalidOracleAccount);
+    
+    // Pyth binary payload layout: offset 208 contains price (i64), offset 216 contains conf (u64), offset 224 contains publish_time (i64)
+    let price_bytes = data.get(208..216).ok_or(RouterError::InvalidOracleAccount)?;
+    let timestamp_bytes = data.get(224..232).ok_or(RouterError::InvalidOracleAccount)?;
+
+    let price = i64::from_le_bytes(price_bytes.try_into().unwrap());
+    let publish_time = i64::from_le_bytes(timestamp_bytes.try_into().unwrap());
+
+    require!(price > 0, RouterError::NegativePriceObserved);
+    require!(
+        current_timestamp - publish_time <= ORACLE_EXPIRY_THRESHOLD_SECS,
+        RouterError::StaleOracleFeed
+    );
+
+    Ok(price as u64)
+}
+
+// -----------------------------------------------------------------------------
+// EVENTS & ERRORS
+// -----------------------------------------------------------------------------
+
+#[event]
+pub struct VaultInitializedEvent {
+    pub vault: Pubkey,
+    pub authority: Pubkey,
+    pub strategy_id: u64,
+    pub timestamp: i64,
+}
 
 #[event]
 pub struct DepositEvent {
     pub user: Pubkey,
     pub amount: u64,
-    pub shares_minted: u64,
-    pub oracle_price: u64,
-}
-
-#[event]
-pub struct RebalanceEvent {
-    pub executor: Pubkey,
-    pub imbalance_bps: u64,
+    pub shares_issued: u64,
     pub timestamp: i64,
 }
 
 #[event]
-pub struct WithdrawEvent {
-    pub user: Pubkey,
-    pub shares_burned: u64,
-    pub assets_returned: u64,
+pub struct RebalancedEvent {
+    pub vault: Pubkey,
+    pub kamino_supplied: u64,
+    pub marginfi_borrowed: u64,
+    pub oracle_price: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct EmergencyHaltEvent {
+    pub vault: Pubkey,
+    pub is_paused: bool,
+    pub timestamp: i64,
 }
 
 #[error_code]
-pub enum ErrorCode {
-    #[msg("Reentrancy protection guard triggered")]
-    ReentrancyDetected,
-    #[msg("Protocol operations are paused by guardian")]
+pub enum RouterError {
+    #[msg("Protocol is currently halted by emergency pause")]
     ProtocolPaused,
-    #[msg("Supplied target LTV exceeds protocol safe threshold")]
-    UnsafeLtvConfig,
-    #[msg("Provided delta imbalance threshold is invalid")]
-    InvalidDeltaThreshold,
-    #[msg("Deposit amount must be strictly greater than zero")]
+    #[msg("Deposit amount must be strictly positive")]
     ZeroDepositAmount,
-    #[msg("Withdrawal amount must be strictly greater than zero")]
-    ZeroWithdrawAmount,
-    #[msg("Arithmetic overflow/underflow detected")]
-    MathOverflow,
-    #[msg("Invalid Oracle Account provided")]
+    #[msg("Rebalance threshold exceeds permissible system maximum")]
+    ExcessiveDeltaThreshold,
+    #[msg("Caller lacks authorized keeper permissions")]
+    UnauthorizedKeeper,
+    #[msg("Caller is not the designated admin authority")]
+    UnauthorizedAdmin,
+    #[msg("Execution price violates strict slippage parameters")]
+    PriceSlippageExceeded,
+    #[msg("Pyth oracle data account is corrupt or malformed")]
     InvalidOracleAccount,
-    #[msg("Pyth oracle price feed is stale")]
-    StaleOraclePrice,
-    #[msg("Pyth price must be positive")]
-    InvalidOraclePrice,
-    #[msg("Pyth oracle confidence interval violated")]
-    OracleConfidenceBreached,
-    #[msg("Delta imbalance is within tolerance. Rebalance aborted")]
-    DeltaWithinTolerance,
-    #[msg("Position shares are insufficient for requested burn amount")]
-    InsufficientShares,
-    #[msg("Zero strategy exposure detected")]
-    ZeroExposure,
+    #[msg("Pyth oracle reported negative price data")]
+    NegativePriceObserved,
+    #[msg("Oracle price feed timestamp exceeds staleness threshold")]
+    StaleOracleFeed,
+    #[msg("Math arithmetic overflow")]
+    MathOverflow,
 }

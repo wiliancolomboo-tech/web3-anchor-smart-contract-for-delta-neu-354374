@@ -1,82 +1,262 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import axios from "axios";
+import { Program } from "@coral-xyz/anchor";
+import { DeltaNeutralRouter } from "../target/types/delta_neutral_router";
+import {
+  createMint,
+  createAccount,
+  mintTo,
+  getAccount,
+} from "@solana/spl-token";
+import { Keypair, PublicKey } from "@solana/web3.js";
+import { expect } from "chai";
 
-interface OraclePriceResponse {
-  price: number;
-  confidence: number;
-  slot: number;
-}
+describe("Aegis Delta-Neutral Yield Router Tests", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
 
-export class AegisKeeperEngine {
-  private connection: Connection;
-  private keeperKeypair: Keypair;
-  private program: anchor.Program;
-  private vaultPda: PublicKey;
-  private strategyPda: PublicKey;
+  const program = anchor.workspace.DeltaNeutralRouter as Program<DeltaNeutralRouter>;
 
-  constructor(
-    rpcUrl: string,
-    keeperKeypair: Keypair,
-    programId: PublicKey,
-    vaultPda: PublicKey,
-    strategyPda: PublicKey
-  ) {
-    this.connection = new Connection(rpcUrl, "confirmed");
-    this.keeperKeypair = keeperKeypair;
-    const wallet = new anchor.Wallet(keeperKeypair);
-    const provider = new anchor.AnchorProvider(this.connection, wallet, {
-      commitment: "confirmed",
-    });
-    this.program = new anchor.Program({} as any, programId, provider);
-    this.vaultPda = vaultPda;
-    this.strategyPda = strategyPda;
-  }
+  const admin = (provider.wallet as anchor.Wallet).payer;
+  const keeper = Keypair.generate();
+  const alice = Keypair.generate();
 
-  public async fetchPythOraclePrice(priceFeedId: string): Promise<number> {
-    const endpoint = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${priceFeedId}`;
-    const response = await axios.get(endpoint);
-    const parsedData = response.data.parsed[0];
-    const price = Number(parsedData.price.price) * Math.pow(10, parsedData.price.expo);
-    return price;
-  }
+  let baseMint: PublicKey;
+  let targetMint: PublicKey;
+  let vaultPda: PublicKey;
+  let vaultBump: number;
+  let shareMintPda: PublicKey;
+  let baseVaultPda: PublicKey;
 
-  public async runKeeperLoop(solUsdFeedId: string, pollIntervalMs: number = 3000) {
-    console.log("🛡️ Aegis Yield Rebalancing Keeper Initialized...");
+  let aliceBaseAccount: PublicKey;
+  let aliceShareAccount: PublicKey;
 
-    setInterval(async () => {
-      try {
-        const spotPrice = await this.fetchPythOraclePrice(solUsdFeedId);
-        const strategyAccount: any = await this.program.account["strategyState"].fetch(
-          this.strategyPda
-        );
+  before(async () => {
+    // Airdrop SOL to test actors
+    const txAirdropAlice = await provider.connection.requestAirdrop(alice.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
+    const txAirdropKeeper = await provider.connection.requestAirdrop(keeper.publicKey, 5 * anchor.web3.LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(txAirdropAlice);
+    await provider.connection.confirmTransaction(txAirdropKeeper);
 
-        const baseCollateral = Number(strategyAccount.baseCollateralAmount) / 1e9;
-        const baseBorrowed = Number(strategyAccount.baseBorrowAmount) / 1e9;
+    // Create Mock Base Mint (USDC, 6 decimals) and Target Mint (SOL, 9 decimals)
+    baseMint = await createMint(provider.connection, admin, admin.publicKey, null, 6);
+    targetMint = await createMint(provider.connection, admin, admin.publicKey, null, 9);
 
-        const longUsdValue = baseCollateral * spotPrice;
-        const shortUsdValue = baseBorrowed * spotPrice;
-        const netDelta = longUsdValue - shortUsdValue;
-        const totalCapital = longUsdValue + shortUsdValue;
+    // Derive PDAs
+    [vaultPda, vaultBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("aegis_vault"), baseMint.toBuffer()],
+      program.programId
+    );
 
-        const deltaImbalanceBps =
-          totalCapital > 0 ? Math.abs((netDelta / totalCapital) * 10_000) : 0;
+    [shareMintPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("aegis_lp_mint"), vaultPda.toBuffer()],
+      program.programId
+    );
 
-        console.log(`[Metrics] Spot: $${spotPrice.toFixed(2)} | Net Delta: $${netDelta.toFixed(2)} | Drift: ${deltaImbalanceBps.toFixed(1)} bps`);
+    [baseVaultPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("base_vault"), vaultPda.toBuffer()],
+      program.programId
+    );
 
-        // Check if delta deviation exceeds 200 bps (2.0%)
-        if (deltaImbalanceBps > 200) {
-          console.log(`⚠️ Delta breach detected (> 200 bps). Triggering atomic rebalance transaction...`);
-          await this.executeRebalanceTx(spotPrice, netDelta);
-        }
-      } catch (error) {
-        console.error("Keeper loop evaluation error:", error);
-      }
-    }, pollIntervalMs);
-  }
+    // Setup Alice Base Token Account with 100,000 USDC
+    aliceBaseAccount = await createAccount(provider.connection, alice, baseMint, alice.publicKey);
+    await mintTo(provider.connection, admin, baseMint, aliceBaseAccount, admin, 100_000 * 1e6);
 
-  private async executeRebalanceTx(spotPrice: number, netDelta: number) {
-    // Construct CPI Context parameters and send rebalance transaction
-    console.log(`🚀 Atomic Rebalance dispatched on-chain with spot price $${spotPrice}`);
-  }
-}
+    aliceShareAccount = await createAccount(provider.connection, alice, shareMintPda, alice.publicKey);
+  });
+
+  it("1. Initializes Vault with strict risk tolerances", async () => {
+    const targetLtvBps = 6000; // 60%
+    const maxLtvBps = 7500;    // 75%
+    const driftToleranceBps = 200; // 2%
+
+    await program.methods
+      .initializeVault(targetLtvBps, maxLtvBps, driftToleranceBps)
+      .accounts({
+        admin: admin.publicKey,
+        keeper: keeper.publicKey,
+        baseMint: baseMint,
+        targetMint: targetMint,
+        vault: vaultPda,
+        shareMint: shareMintPda,
+        baseVault: baseVaultPda,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .rpc();
+
+    const vault = await program.account.vaultState.fetch(vaultPda);
+    expect(vault.admin.toBase58()).to.equal(admin.publicKey.toBase58());
+    expect(vault.keeper.toBase58()).to.equal(keeper.publicKey.toBase58());
+    expect(vault.targetLtvBps).to.equal(targetLtvBps);
+    expect(vault.maxLtvBps).to.equal(maxLtvBps);
+    expect(vault.isPaused).to.be.false;
+  });
+
+  it("2. Accepts user deposits and mints 1:1 shares on genesis", async () => {
+    const depositAmount = new anchor.BN(10_000 * 1e6); // 10,000 USDC
+
+    await program.methods
+      .deposit(depositAmount)
+      .accounts({
+        user: alice.publicKey,
+        vault: vaultPda,
+        baseVault: baseVaultPda,
+        shareMint: shareMintPda,
+        userBaseToken: aliceBaseAccount,
+        userShareToken: aliceShareAccount,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([alice])
+      .rpc();
+
+    const vault = await program.account.vaultState.fetch(vaultPda);
+    expect(vault.totalManagedBase.toNumber()).to.equal(depositAmount.toNumber());
+
+    const aliceShares = await getAccount(provider.connection, aliceShareAccount);
+    expect(Number(aliceShares.amount)).to.equal(depositAmount.toNumber());
+  });
+
+  it("3. Enforces LTV ceiling and blocks over-leveraged rebalancing", async () => {
+    // Attempting to borrow SOL at 90% LTV should be rejected
+    const mockMfiGroup = Keypair.generate().publicKey;
+    const mockMfiAccount = Keypair.generate().publicKey;
+    const mockBaseBank = Keypair.generate().publicKey;
+    const mockBaseMfiVault = Keypair.generate().publicKey;
+    const mockTargetBank = Keypair.generate().publicKey;
+    const mockTargetMfiVault = Keypair.generate().publicKey;
+    const mockKaminoMarket = Keypair.generate().publicKey;
+    const mockKaminoReserve = Keypair.generate().publicKey;
+    const mockKaminoSupply = Keypair.generate().publicKey;
+
+    const vaultTargetAccount = await createAccount(
+      provider.connection,
+      admin,
+      targetMint,
+      vaultPda
+    );
+
+    const excessiveBorrowSol = new anchor.BN(60 * 1e9); // 60 SOL @ $150 = $9,000 against $10,000 (90% LTV)
+    const solPriceScaled = new anchor.BN(150 * 1e6); // $150.00 scaled
+
+    try {
+      await program.methods
+        .rebalanceRoute(new anchor.BN(0), excessiveBorrowSol, solPriceScaled)
+        .accounts({
+          keeper: keeper.publicKey,
+          vault: vaultPda,
+          baseVault: baseVaultPda,
+          targetMint: targetMint,
+          vaultTargetToken: vaultTargetAccount,
+          marginfiProgram: program.programId, // Mock CPI target
+          marginfiGroup: mockMfiGroup,
+          marginfiAccount: mockMfiAccount,
+          marginfiBaseBank: mockBaseBank,
+          marginfiBaseVault: mockBaseMfiVault,
+          marginfiTargetBank: mockTargetBank,
+          marginfiTargetVault: mockTargetMfiVault,
+          kaminoProgram: program.programId,
+          kaminoMarket: mockKaminoMarket,
+          kaminoReserve: mockKaminoReserve,
+          kaminoLiquiditySupply: mockKaminoSupply,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .signers([keeper])
+        .rpc();
+
+      expect.fail("Should have failed with LtvLimitExceeded");
+    } catch (err: any) {
+      expect(err.error?.errorCode?.code).to.equal("LtvLimitExceeded");
+    }
+  });
+
+  it("4. Rejects unprivileged emergency pause calls", async () => {
+    try {
+      await program.methods
+        .emergencyUnwind(true)
+        .accounts({
+          admin: alice.publicKey, // Not the authorized admin
+          vault: vaultPda,
+          vaultTargetToken: baseVaultPda,
+          marginfiTargetVault: baseVaultPda,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .signers([alice])
+        .rpc();
+
+      expect.fail("Should have rejected unauthorized caller");
+    } catch (err: any) {
+      expect(err.error?.errorCode?.code).to.equal("Unauthorized");
+    }
+  });
+
+  it("5. Allows admin to trigger emergency circuit breaker and blocks actions", async () => {
+    await program.methods
+      .emergencyUnwind(true)
+      .accounts({
+        admin: admin.publicKey,
+        vault: vaultPda,
+        vaultTargetToken: baseVaultPda,
+        marginfiTargetVault: baseVaultPda,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    const vault = await program.account.vaultState.fetch(vaultPda);
+    expect(vault.isPaused).to.be.true;
+
+    // Deposit should now fail
+    try {
+      await program.methods
+        .deposit(new anchor.BN(100 * 1e6))
+        .accounts({
+          user: alice.publicKey,
+          vault: vaultPda,
+          baseVault: baseVaultPda,
+          shareMint: shareMintPda,
+          userBaseToken: aliceBaseAccount,
+          userShareToken: aliceShareAccount,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .signers([alice])
+        .rpc();
+
+      expect.fail("Should have blocked deposit during paused state");
+    } catch (err: any) {
+      expect(err.error?.errorCode?.code).to.equal("VaultPaused");
+    }
+  });
+
+  it("6. Allows proportional withdrawals upon unpausing", async () => {
+    // Unpause vault
+    await program.methods
+      .emergencyUnwind(false)
+      .accounts({
+        admin: admin.publicKey,
+        vault: vaultPda,
+        vaultTargetToken: baseVaultPda,
+        marginfiTargetVault: baseVaultPda,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    const burnShares = new anchor.BN(5_000 * 1e6); // Burn 50% shares
+
+    await program.methods
+      .withdraw(burnShares)
+      .accounts({
+        user: alice.publicKey,
+        vault: vaultPda,
+        baseVault: baseVaultPda,
+        shareMint: shareMintPda,
+        userBaseToken: aliceBaseAccount,
+        userShareToken: aliceShareAccount,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([alice])
+      .rpc();
+
+    const vault = await program.account.vaultState.fetch(vaultPda);
+    expect(vault.totalManagedBase.toNumber()).to.equal(5_000 * 1e6);
+  });
+});

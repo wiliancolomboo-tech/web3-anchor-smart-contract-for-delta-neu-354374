@@ -1,0 +1,18 @@
+FROM node:20-slim AS base
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package.json yarn.lock tsconfig.json ./
+RUN yarn install --frozen-lockfile
+
+COPY client/ ./client/
+COPY target/types/ ./target/types/
+
+ENV NODE_ENV=production
+CMD ["npx", "ts-node", "client/keeper.ts"]

@@ -1,6 +1,15 @@
-solana-test-validator \
-  --url https://api.mainnet-beta.solana.com \
-  --clone MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA \
-  --clone KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD \
-  --clone H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4SE5nv \
-  --reset
+# Set Solana CLI to Target Network
+solana config set --url https://api.mainnet-beta.solana.com
+
+# Build program binaries
+anchor build
+
+# Recover or verify program ID address
+solana address -k target/deploy/delta_neutral_router-keypair.json
+
+# Deploy to network using buffer account
+solana program deploy \
+  --program-id target/deploy/delta_neutral_router-keypair.json \
+  target/deploy/delta_neutral_router.so \
+  --with-compute-unit-price 10000 \
+  --max-sign-attempts 5

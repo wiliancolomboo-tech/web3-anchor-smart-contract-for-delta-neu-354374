@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  aegis-sentinel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aegis-delta-keeper
+    restart: always
+    environment:
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL}
+      - KEEPER_PRIVATE_KEY=${KEEPER_PRIVATE_KEY}
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - ENTERPRISE_SLACK_WEBHOOK_URL=${ENTERPRISE_SLACK_WEBHOOK_URL}
+      - ALERT_ESCALATION_EMAIL=devops@aegisdelta.io
+      - PROGRAM_ID=Aegis111111111111111111111111111111111111111
+    ports:
+      - "8080:8080"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"

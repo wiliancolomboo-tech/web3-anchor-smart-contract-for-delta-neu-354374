@@ -1,6 +1,14 @@
+// tests/aegis-delta-neutral.ts
+
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { DeltaNeutralRouter } from "../target/types/delta_neutral_router";
+import { AegisDeltaNeutral } from "../target/types/aegis_delta_neutral";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  SYSVAR_RENT_PUBKEY,
+} from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
   createMint,
@@ -8,172 +16,218 @@ import {
   mintTo,
   getAccount,
 } from "@solana/spl-token";
-import { Keypair, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import { expect } from "chai";
 
-describe("delta-neutral-router integration tests", () => {
+describe("Aegis Delta-Neutral Vault Program Suite", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.DeltaNeutralRouter as Program<DeltaNeutralRouter>;
+  const program = anchor.workspace.AegisDeltaNeutral as Program<AegisDeltaNeutral>;
 
-  let usdcMint: PublicKey;
-  let solMint: PublicKey;
-  let admin = Keypair.generate();
-  let user = Keypair.generate();
-  let keeper = Keypair.generate();
+  let underlyingMint: PublicKey;
+  let lpMintKeypair: Keypair;
+  let vaultPda: PublicKey;
+  let vaultBump: number;
+  let vaultAuthorityPda: PublicKey;
+  let authorityBump: number;
+  let keeper: Keypair;
+  let user: Keypair;
+  let userTokenAccount: PublicKey;
+  let userLpAccount: PublicKey;
+  let vaultTokenAccount: PublicKey;
 
-  let userUsdcAccount: PublicKey;
-  let userShareAccount: PublicKey;
-
-  let strategyPda: PublicKey;
-  let authorityPda: PublicKey;
-  let usdcVaultPda: PublicKey;
-  let shareMintPda: PublicKey;
-
-  const vaultId = new anchor.BN(42);
+  // Mock Kamino & Marginfi PDAs
+  const mockKaminoObligation = Keypair.generate().publicKey;
+  const mockMarginfiAccount = Keypair.generate().publicKey;
 
   before(async () => {
-    // Fund Admin, User, Keeper
-    for (const kp of [admin, user, keeper]) {
-      const sig = await provider.connection.requestAirdrop(kp.publicKey, 10 * LAMPORTS_PER_SOL);
-      await provider.connection.confirmTransaction(sig);
-    }
+    keeper = Keypair.generate();
+    user = Keypair.generate();
+    lpMintKeypair = Keypair.generate();
 
-    // Initialize Mock SPL Tokens
-    usdcMint = await createMint(provider.connection, admin, admin.publicKey, null, 6);
-    solMint = await createMint(provider.connection, admin, admin.publicKey, null, 9);
-
-    // Derive PDAs
-    [strategyPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("vault"), vaultId.toArrayLike(Buffer, "le", 8)],
-      program.programId
+    // Airdrop SOL to test actors
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(provider.wallet.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL)
     );
-    [authorityPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("authority"), strategyPda.toBuffer()],
-      program.programId
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(user.publicKey, 5 * anchor.web3.LAMPORTS_PER_SOL)
     );
-    [usdcVaultPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("usdc_vault"), strategyPda.toBuffer()],
-      program.programId
-    );
-    [shareMintPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("shares"), strategyPda.toBuffer()],
-      program.programId
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(keeper.publicKey, 5 * anchor.web3.LAMPORTS_PER_SOL)
     );
 
-    // Setup User USDC token account
-    userUsdcAccount = await createAccount(provider.connection, user, usdcMint, user.publicKey);
-    await mintTo(provider.connection, admin, usdcMint, userUsdcAccount, admin, 1_000_000_000); // 1,000 USDC
+    // Create Base Collateral Token (USDC/SOL equivalent)
+    underlyingMint = await createMint(
+      provider.connection,
+      (provider.wallet as any).payer,
+      provider.wallet.publicKey,
+      null,
+      6
+    );
 
-    // Create user share token holding account
-    userShareAccount = await createAccount(provider.connection, user, shareMintPda, user.publicKey);
+    // Derive Program PDAs
+    [vaultPda, vaultBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("aegis_vault"), underlyingMint.toBuffer()],
+      program.programId
+    );
+
+    [vaultAuthorityPda, authorityBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("aegis_authority"), vaultPda.toBuffer()],
+      program.programId
+    );
+
+    // Create Associated Token Accounts
+    vaultTokenAccount = await createAccount(
+      provider.connection,
+      (provider.wallet as any).payer,
+      underlyingMint,
+      vaultAuthorityPda
+    );
+
+    userTokenAccount = await createAccount(
+      provider.connection,
+      (provider.wallet as any).payer,
+      underlyingMint,
+      user.publicKey
+    );
+
+    userLpAccount = await createAccount(
+      provider.connection,
+      (provider.wallet as any).payer,
+      lpMintKeypair.publicKey,
+      user.publicKey
+    );
+
+    // Mint underlying funds to user
+    await mintTo(
+      provider.connection,
+      (provider.wallet as any).payer,
+      underlyingMint,
+      userTokenAccount,
+      provider.wallet.publicKey,
+      1_000_000_000 // 1,000 units
+    );
   });
 
-  it("Initializes the strategy vault with verified boundary constraints", async () => {
-    const mockMarginfiAccount = Keypair.generate().publicKey;
-    const mockKaminoObligation = Keypair.generate().publicKey;
+  it("1. Successfully initializes the delta-neutral vault with strict parameters", async () => {
+    const targetLeverageBps = new anchor.BN(10_000); // 1.0x
+    const rebalanceThresholdBps = new anchor.BN(50); // 0.50%
 
-    await program.methods
-      .initializeStrategy(vaultId, new anchor.BN(6000)) // 60% LTV
+    const tx = await program.methods
+      .initializeVault(targetLeverageBps, rebalanceThresholdBps)
       .accounts({
-        strategy: strategyPda,
-        strategyAuthority: authorityPda,
-        admin: admin.publicKey,
-        usdcMint,
-        solMint,
-        usdcVault: usdcVaultPda,
-        shareMint: shareMintPda,
-        marginfiAccount: mockMarginfiAccount,
+        vault: vaultPda,
+        vaultAuthority: vaultAuthorityPda,
+        underlyingMint: underlyingMint,
+        lpMint: lpMintKeypair.publicKey,
         kaminoObligation: mockKaminoObligation,
-        systemProgram: anchor.web3.SystemProgram.programId,
+        marginfiAccount: mockMarginfiAccount,
+        keeper: keeper.publicKey,
+        authority: provider.wallet.publicKey,
+        systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        rent: SYSVAR_RENT_PUBKEY,
       })
-      .signers([admin])
+      .signers([lpMintKeypair])
       .rpc();
 
-    const vault = await program.account.strategyVault.fetch(strategyPda);
-    expect(vault.vaultId.toNumber()).to.equal(42);
-    expect(vault.targetLeverageBps.toNumber()).to.equal(6000);
-    expect(vault.isRebalancing).to.be.false;
+    expect(tx).to.be.a("string");
+
+    const vaultAccount = await program.account.vaultState.fetch(vaultPda);
+    expect(vaultAccount.authority.toBase58()).to.equal(provider.wallet.publicKey.toBase58());
+    expect(vaultAccount.keeper.toBase58()).to.equal(keeper.publicKey.toBase58());
+    expect(vaultAccount.targetLeverageBps.toNumber()).to.equal(10_000);
+    expect(vaultAccount.isPaused).to.be.false;
   });
 
-  it("Executes a valid user deposit and mints exact LP share equivalents", async () => {
-    const depositAmount = new anchor.BN(500_000_000); // 500 USDC
-    const mockPythSol = Keypair.generate().publicKey;
-    const mockPythUsdc = Keypair.generate().publicKey;
+  it("2. Permits LP deposit and mints 1:1 proportional initial LP shares", async () => {
+    const depositAmount = new anchor.BN(500_000_000); // 500 units
 
     await program.methods
       .deposit(depositAmount)
       .accounts({
-        strategy: strategyPda,
-        strategyAuthority: authorityPda,
+        vault: vaultPda,
+        vaultAuthority: vaultAuthorityPda,
+        vaultTokenAccount: vaultTokenAccount,
+        userTokenAccount: userTokenAccount,
+        lpMint: lpMintKeypair.publicKey,
+        userLpAccount: userLpAccount,
         user: user.publicKey,
-        userUsdc: userUsdcAccount,
-        usdcVault: usdcVaultPda,
-        shareMint: shareMintPda,
-        userShares: userShareAccount,
-        pythSolFeed: mockPythSol,
-        pythUsdcFeed: mockPythUsdc,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([user])
       .rpc();
 
-    const vaultUsdc = await getAccount(provider.connection, usdcVaultPda);
-    expect(Number(vaultUsdc.amount)).to.equal(500_000_000);
+    const vaultAccount = await program.account.vaultState.fetch(vaultPda);
+    expect(vaultAccount.totalDeposited.toNumber()).to.equal(500_000_000);
 
-    const userShares = await getAccount(provider.connection, userShareAccount);
-    expect(Number(userShares.amount)).to.equal(500_000_000);
+    const userLpToken = await getAccount(provider.connection, userLpAccount);
+    expect(Number(userLpToken.amount)).to.equal(500_000_000);
   });
 
-  it("Rejects zero-token deposit attempts", async () => {
+  it("3. Enforces authorization: Rejects unauthorized caller trying to trigger delta routing", async () => {
+    const imposter = Keypair.generate();
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(imposter.publicKey, 1 * anchor.web3.LAMPORTS_PER_SOL)
+    );
+
     try {
       await program.methods
-        .deposit(new anchor.BN(0))
+        .executeDeltaRoute(new anchor.BN(1000), new anchor.BN(1000), new anchor.BN(20_000_000))
         .accounts({
-          strategy: strategyPda,
-          strategyAuthority: authorityPda,
+          vault: vaultPda,
+          vaultAuthority: vaultAuthorityPda,
+          vaultTokenAccount: vaultTokenAccount,
+          vaultHedgeAccount: userTokenAccount,
+          kaminoProgram: SystemProgram.programId,
+          kaminoReserve: Keypair.generate().publicKey,
+          kaminoObligation: mockKaminoObligation,
+          marginfiProgram: SystemProgram.programId,
+          marginfiGroup: Keypair.generate().publicKey,
+          marginfiBank: Keypair.generate().publicKey,
+          marginfiAccount: mockMarginfiAccount,
+          signer: imposter.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([imposter])
+        .rpc();
+      expect.fail("Unauthorized caller should have been rejected");
+    } catch (err: any) {
+      expect(err.error.errorCode.code).to.equal("UnauthorizedCaller");
+    }
+  });
+
+  it("4. Triggers emergency circuit breaker and blocks subsequent user deposits", async () => {
+    await program.methods
+      .emergencyPauseAndUnwind()
+      .accounts({
+        vault: vaultPda,
+        authority: provider.wallet.publicKey,
+      })
+      .rpc();
+
+    const vaultAccount = await program.account.vaultState.fetch(vaultPda);
+    expect(vaultAccount.isPaused).to.be.true;
+
+    // Verify Deposit reverts when paused
+    try {
+      await program.methods
+        .deposit(new anchor.BN(10_000_000))
+        .accounts({
+          vault: vaultPda,
+          vaultAuthority: vaultAuthorityPda,
+          vaultTokenAccount: vaultTokenAccount,
+          userTokenAccount: userTokenAccount,
+          lpMint: lpMintKeypair.publicKey,
+          userLpAccount: userLpAccount,
           user: user.publicKey,
-          userUsdc: userUsdcAccount,
-          usdcVault: usdcVaultPda,
-          shareMint: shareMintPda,
-          userShares: userShareAccount,
-          pythSolFeed: Keypair.generate().publicKey,
-          pythUsdcFeed: Keypair.generate().publicKey,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
         .signers([user])
         .rpc();
-      expect.fail("Deposit of zero should have failed");
+      expect.fail("Deposit should have been rejected while vault is paused");
     } catch (err: any) {
-      expect(err.error.errorCode.code).to.equal("ZeroDepositAmount");
+      expect(err.error.errorCode.code).to.equal("VaultIsPaused");
     }
-  });
-
-  it("Allows user to withdraw capital proportional to burned shares", async () => {
-    const burnAmount = new anchor.BN(250_000_000); // Burn 50% of shares
-
-    await program.methods
-      .withdraw(burnAmount)
-      .accounts({
-        strategy: strategyPda,
-        strategyAuthority: authorityPda,
-        user: user.publicKey,
-        userShares: userShareAccount,
-        shareMint: shareMintPda,
-        usdcVault: usdcVaultPda,
-        userUsdc: userUsdcAccount,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([user])
-      .rpc();
-
-    const userShares = await getAccount(provider.connection, userShareAccount);
-    expect(Number(userShares.amount)).to.equal(250_000_000);
-
-    const vaultUsdc = await getAccount(provider.connection, usdcVaultPda);
-    expect(Number(vaultUsdc.amount)).to.equal(250_000_000);
   });
 });

@@ -1,16 +1,13 @@
-# 1. Build & Test Solana Anchor Program
+# 1. Install Solana toolchain & Anchor
+sh -c "$(curl -sSfL https://release.solana.com/v1.18.26/install)"
+cargo install --git https://github.com/coral-xyz/anchor --tag v0.30.1 anchor-cli --locked
+
+# 2. Build program
 anchor build
-anchor test
 
-# 2. Deploy Program to Solana Mainnet-Beta
-solana program deploy \
-  --program-id target/deploy/delta_neutral_router-keypair.json \
-  target/deploy/delta_neutral_router.so \
-  --url-override https://api.mainnet-beta.solana.com
+# 3. Synchronize program keys
+anchor keys sync
 
-# 3. Bootstrap Keeper Bot & Start Dockerized Daemon
-docker-compose up -d --build
-
-# 4. Verify Telemetry & Live Healthcheck
-curl -f http://localhost:8080/health
-curl -s http://localhost:8080/metrics | grep dnyr_
+# 4. Deploy to Devnet / Mainnet
+solana config set --url https://api.devnet.solana.com
+anchor deploy --program-name neutra_yield --program-keypair ./target/deploy/neutra_yield-keypair.json

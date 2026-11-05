@@ -1,34 +1,32 @@
 flowchart TD
-    subgraph ClientLayer["Enterprise Client & Keeper Layer"]
-        A[Institutional Depositor] -->|1. Deposit USDC| B[Aura SDK / Web3 Client]
-        K[Autonomous Keeper Daemon] -->|Check Delta Drift & Health| OR[Pyth / Switchboard Oracles]
-        K -->|2. Trigger Rebalance| SC[Anchor Delta Router Program]
+    subgraph Client / LP
+        A[Institutional LP] -->|Deposit USDC| B[Vault Router CPI Endpoint]
+        A -->|Request Redemption| C[Withdrawal Queue]
     end
 
-    subgraph ProgramLayer["Solana On-Chain Anchor Engine"]
-        SC -->|Verify Invariants| VM{Net Delta within Tolerance?}
-        SC -->|PDA Authority| PDA[Vault PDA Signer]
+    subgraph Solana Runtime: Anchor Delta-Neutral Program
+        B --> D{Validate Pyth Oracle}
+        D -->|Price Fresh & Valid| E[Compute Target Delta Ratio]
+        D -->|Stale / Divergent| ERR[Abort: ErrCode::StaleOracleFeed]
         
-        subgraph CPI_Execution["Atomic CPI Execution Engine"]
-            PDA -->|CPI: deposit / borrow_hedge| MF[Marginfi v2 Program]
-            PDA -->|CPI: invest / harvest_yield| KM[Kamino Finance Program]
-        end
-
-        VM -- Delta Drift Exceeded --> EX[Execute Atomic Hedge/Unhedge]
-        EX --> PDA
+        E --> F[Kamino Lending CPI: deposit_reserve_liquidity]
+        E --> G[Marginfi v2 CPI: lending_account_borrow]
+        
+        F --> H[Update PDA Vault Ledger]
+        G --> H
+        
+        H --> I[Mint vTokens to LP PDA]
     end
 
-    subgraph ProtocolState["Protocol State Storage (Zero-Copy)"]
-        VS[(VaultState PDA)]
-        US[(UserPosition PDA)]
-        OR_CACHE[(Oracle Price Feeds)]
+    subgraph Autonomous Keeper & Sentinel Bot
+        K[TypeScript Sentinel Keeper] -->|Poll Pyth & Health Factors| L{Abs Delta > 0.75%?}
+        L -->|Yes| M[Execute rebalance_vault Instruction]
+        L -->|No| N[Heartbeat Sleep 10s]
+        M --> O[Dispatch Webhook Telemetry to Slack / Discord / Resend]
     end
 
-    subgraph Telemetry["Enterprise Alerting & Observability"]
-        K -->|HTTP Webhook Alert| SLACK[Enterprise Slack / Discord Ops]
-        K -->|Critical Failure Event| RESEND[Resend API: PagerDuty / Email]
+    subgraph Protocol Dependencies
+        F --> P[(Kamino Reserve PDA)]
+        G --> Q[(Marginfi Bank PDA)]
+        D --> R[(Pyth Network SOL/USD Feed)]
     end
-
-    SC -.->|State Mutated| VS
-    SC -.->|User Balance Updated| US
-    SC -.->|Read Spot & Debt Prices| OR_CACHE

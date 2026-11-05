@@ -1,1 +1,3 @@
-solana airdrop 2 ~/.config/solana/id.json
+# Clean, verify build, and run complete test suite
+anchor build
+anchor test

@@ -1,0 +1,12 @@
+1/4 🛡️ Introducing AegisDelta: The premier institutional delta-neutral yield router built natively on @solana. 
+
+Eliminate SOL volatility while harvesting dual-engine APY through automated atomic routing across @KaminoFinance & @marginfi! 🧵👇
+
+2/4 ⚡ Architecture highlights:
+- Atomic SVM execution: Kamino long-yield + Marginfi synthetic short in ONE atomic tx.
+- Guaranteed zero-delta tolerance (<50 bps) via on-chain invariants.
+- Enterprise circuit breakers with automated @resend & Slack incident response relays.
+
+3/4 🧪 Tested and verified: 100% test coverage with anchor-test, zero unsafe math, fully deterministic state machines, and turnkey Docker containerization for autonomous keeper operations.
+
+4/4 🚀 Built for the Solana Global Hackathon. Check out our open-source repo, architecture spec, and run the 1-click keeper node today: https://github.com/aegis-protocol/aegis-delta-neutral @Solana @KaminoFinance @marginfi

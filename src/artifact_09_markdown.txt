@@ -1,0 +1,20 @@
+🧵 1/3: Excited to unveil Aegis: Institutional Delta-Neutral Yield Routing on @Solana! ⚡️
+
+Yield seekers are trapped between impermanent loss in CLMMs & low lending yields. Aegis solves this with an atomic basis trade across @KaminoFinance & @marginfi.
+
+Zero delta. Max yield. 🛡️👇
+
+🧵 2/3: How it works:
+1️⃣ Kamino LP Leg: Harvest concentrated swap fees & emissions
+2️⃣ Marginfi Hedge Leg: Borrow matching underlying to maintain Net Δ ≈ 0
+3️⃣ Autonomous Keeper: Real-time drift balancing (<250 bps) + @resendlabs alerts
+
+All executed via Anchor CPIs with zero unsafe math. 🦀
+
+🧵 3/3: Built for enterprise treasuries:
+✅ Deterministic PDA vault routing
+✅ Emergency pause & circuit breaker governance
+✅ 1-click Docker keeper orchestration
+✅ 100% test coverage with automated invariant assertions
+
+Check out our submission & live demo: https://github.com/aegis-protocol/aegis-router

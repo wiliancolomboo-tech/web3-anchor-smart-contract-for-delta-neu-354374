@@ -1,16 +1,24 @@
-FROM node:20-slim AS runner
-WORKDIR /app
+FROM node:20-slim AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential python3 curl && \
-    rm -rf /var/lib/apt/lists/*
+WORKDIR /usr/src/app
 
-COPY keeper/package*.json ./
+COPY package*.json ./
+COPY tsconfig.json ./
 RUN npm ci
 
-COPY keeper/ ./
+COPY client/ ./client/
 RUN npm run build
 
-USER node
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY --from=builder /usr/src/app/dist ./dist
+
 ENV NODE_ENV=production
-CMD ["node", "dist/rebalancer.js"]
+USER node
+
+CMD ["node", "dist/client/src/keeper-service.js"]

@@ -1,67 +1,112 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
-use crate::state::*;
+use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
+use crate::state::{VaultState, VAULT_SEED};
+use crate::errors::RouterError;
+use crate::events::DepositEvent;
 
 #[derive(Accounts)]
-pub struct InitializeStrategy<'info> {
+pub struct Deposit<'info> {
     #[account(mut)]
-    pub admin: Signer<'info>,
-
-    pub base_mint: Account<'info, Mint>,
-    pub volatile_mint: Account<'info, Mint>,
+    pub user: Signer<'info>,
 
     #[account(
-        init,
-        payer = admin,
-        space = StrategyState::LEN,
-        seeds = [STRATEGY_SEED, base_mint.key().as_ref(), volatile_mint.key().as_ref()],
-        bump
+        mut,
+        seeds = [VAULT_SEED, vault.base_mint.as_ref()],
+        bump = vault.vault_bump,
+        has_one = base_vault,
+        has_one = share_mint
     )]
-    pub strategy: Account<'info, StrategyState>,
+    pub vault: Account<'info, VaultState>,
 
-    /// CHECK: Vault Authority Seed Checked
+    #[account(mut)]
+    pub base_vault: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub share_mint: Account<'info, Mint>,
+
     #[account(
-        seeds = [VAULT_AUTHORITY_SEED, strategy.key().as_ref()],
-        bump
+        mut,
+        constraint = user_base_token.owner == user.key(),
+        constraint = user_base_token.mint == vault.base_mint
     )]
-    pub vault_authority: AccountInfo<'info>,
+    pub user_base_token: Account<'info, TokenAccount>,
 
     #[account(
-        init,
-        payer = admin,
-        token::mint = base_mint,
-        token::authority = vault_authority
+        mut,
+        constraint = user_share_token.owner == user.key(),
+        constraint = user_share_token.mint == vault.share_mint
     )]
-    pub vault_base_token: Account<'info, TokenAccount>,
+    pub user_share_token: Account<'info, TokenAccount>,
 
-    pub pyth_oracle_base: AccountInfo<'info>,
-    pub pyth_oracle_volatile: AccountInfo<'info>,
-
-    pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
-pub fn handler(
-    ctx: Context<InitializeStrategy>,
-    target_ltv_bps: u16,
-    max_drift_bps: u16,
-) -> Result<()> {
-    let strategy = &mut ctx.accounts.strategy;
-    strategy.admin = ctx.accounts.admin.key();
-    strategy.base_mint = ctx.accounts.base_mint.key();
-    strategy.volatile_mint = ctx.accounts.volatile_mint.key();
-    strategy.auth_bump = ctx.bumps.vault_authority;
-    strategy.bump = ctx.bumps.strategy;
-    strategy.target_ltv_bps = target_ltv_bps;
-    strategy.max_drift_bps = max_drift_bps;
-    strategy.is_locked = 0;
-    strategy.total_shares = 0;
-    strategy.kamino_supplied_amount = 0;
-    strategy.marginfi_collateral_amount = 0;
-    strategy.marginfi_borrowed_amount = 0;
-    strategy.pyth_oracle_base = ctx.accounts.pyth_oracle_base.key();
-    strategy.pyth_oracle_volatile = ctx.accounts.pyth_oracle_volatile.key();
+pub fn handler(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    require!(!ctx.accounts.vault.is_paused, RouterError::VaultPaused);
+    require!(amount > 0, RouterError::ZeroDepositAmount);
+
+    let total_shares = ctx.accounts.share_mint.supply;
+    let total_base = ctx.accounts.vault.total_managed_base;
+
+    // Calculate LP shares to mint:
+    // If first deposit, shares = amount.
+    // Else shares = (amount * total_shares) / total_base
+    let shares_to_mint = if total_shares == 0 || total_base == 0 {
+        amount
+    } else {
+        (amount as u128)
+            .checked_mul(total_shares as u128)
+            .ok_or(RouterError::MathOverflow)?
+            .checked_div(total_base as u128)
+            .ok_or(RouterError::MathOverflow)? as u64
+    };
+
+    require!(shares_to_mint > 0, RouterError::ZeroShares);
+
+    // Transfer base collateral into Vault
+    let transfer_ctx = CpiContext::new(
+        ctx.accounts.token_program.to_account_info(),
+        Transfer {
+            from: ctx.accounts.user_base_token.to_account_info(),
+            to: ctx.accounts.base_vault.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        },
+    );
+    token::transfer(transfer_ctx, amount)?;
+
+    // Mint LP shares via Vault PDA
+    let base_mint_key = ctx.accounts.vault.base_mint;
+    let seeds = &[
+        VAULT_SEED,
+        base_mint_key.as_ref(),
+        &[ctx.accounts.vault.vault_bump],
+    ];
+    let signer = &[&seeds[..]];
+
+    let mint_ctx = CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        MintTo {
+            mint: ctx.accounts.share_mint.to_account_info(),
+            to: ctx.accounts.user_share_token.to_account_info(),
+            authority: ctx.accounts.vault.to_account_info(),
+        },
+        signer,
+    );
+    token::mint_to(mint_ctx, shares_to_mint)?;
+
+    // Update vault state accounting
+    let vault = &mut ctx.accounts.vault;
+    vault.total_managed_base = vault
+        .total_managed_base
+        .checked_add(amount)
+        .ok_or(RouterError::MathOverflow)?;
+
+    emit!(DepositEvent {
+        user: ctx.accounts.user.key(),
+        base_amount: amount,
+        shares_minted: shares_to_mint,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
 
     Ok(())
 }

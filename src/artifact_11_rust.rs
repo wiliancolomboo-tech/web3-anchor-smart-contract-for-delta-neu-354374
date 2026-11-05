@@ -1,73 +1,81 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-use crate::errors::AegisError;
-use crate::math::FixedPointMath;
-use crate::state::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use crate::state::{VaultState, VAULT_SEED};
+use crate::errors::RouterError;
+use crate::events::HarvestEvent;
 
 #[derive(Accounts)]
-pub struct DepositCapital<'info> {
+pub struct HarvestAndCompound<'info> {
+    #[account(
+        mut,
+        constraint = keeper.key() == vault.keeper || keeper.key() == vault.admin @ RouterError::Unauthorized
+    )]
+    pub keeper: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, vault.base_mint.as_ref()],
+        bump = vault.vault_bump,
+        has_one = base_vault
+    )]
+    pub vault: Account<'info, VaultState>,
+
     #[account(mut)]
-    pub user: Signer<'info>,
+    pub base_vault: Account<'info, TokenAccount>,
 
-    #[account(
-        mut,
-        seeds = [STRATEGY_SEED, strategy.base_mint.as_ref(), strategy.volatile_mint.as_ref()],
-        bump = strategy.bump
-    )]
-    pub strategy: Account<'info, StrategyState>,
-
-    #[account(
-        mut,
-        constraint = user_base_token.mint == strategy.base_mint
-    )]
-    pub user_base_token: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        constraint = vault_base_token.mint == strategy.base_mint
-    )]
-    pub vault_base_token: Account<'info, TokenAccount>,
+    /// Reward or surplus tokens generated from Kamino position
+    #[account(mut)]
+    pub yield_source_token: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
 }
 
-pub fn handler(ctx: Context<DepositCapital>, amount: u64) -> Result<()> {
-    let strategy = &mut ctx.accounts.strategy;
+pub fn handler(
+    ctx: Context<HarvestAndCompound>,
+    gross_yield_amount: u64,
+    borrow_interest_liability: u64,
+) -> Result<()> {
+    require!(!ctx.accounts.vault.is_paused, RouterError::VaultPaused);
 
-    require!(strategy.is_locked == 0, AegisError::ReentrancyGuardTriggered);
-    strategy.is_locked = 1;
+    let net_surplus = gross_yield_amount
+        .checked_sub(borrow_interest_liability)
+        .ok_or(RouterError::InsufficientLiquidity)?;
 
-    // 1. Transfer user funds into strategy vault
-    let cpi_accounts = Transfer {
-        from: ctx.accounts.user_base_token.to_account_info(),
-        to: ctx.accounts.vault_base_token.to_account_info(),
-        authority: ctx.accounts.user.to_account_info(),
-    };
-    let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-    token::transfer(cpi_ctx, amount)?;
+    let base_mint_key = ctx.accounts.vault.base_mint;
+    let seeds = &[
+        VAULT_SEED,
+        base_mint_key.as_ref(),
+        &[ctx.accounts.vault.vault_bump],
+    ];
+    let signer = &[&seeds[..]];
 
-    // 2. Share Minting Calculation
-    let total_strategy_val = strategy
-        .kamino_supplied_amount
-        .checked_add(strategy.marginfi_collateral_amount)
-        .unwrap()
-        .saturating_sub(strategy.marginfi_borrowed_amount);
+    if net_surplus > 0 {
+        // Transfer net surplus into vault base reserve
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.yield_source_token.to_account_info(),
+                to: ctx.accounts.base_vault.to_account_info(),
+                authority: ctx.accounts.vault.to_account_info(),
+            },
+            signer,
+        );
+        token::transfer(transfer_ctx, net_surplus)?;
 
-    let shares_to_mint = FixedPointMath::compute_shares_to_mint(
-        amount,
-        total_strategy_val,
-        strategy.total_shares,
-    )?;
+        // Auto-compound total managed base
+        let vault = &mut ctx.accounts.vault;
+        vault.total_managed_base = vault
+            .total_managed_base
+            .checked_add(net_surplus)
+            .ok_or(RouterError::MathOverflow)?;
+    }
 
-    require!(shares_to_mint > 0, AegisError::ZeroSharesMinted);
+    emit!(HarvestEvent {
+        gross_rewards: gross_yield_amount,
+        borrow_fee_paid: borrow_interest_liability,
+        net_surplus_compounded: net_surplus,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
 
-    // 3. Update State
-    strategy.total_shares = strategy.total_shares.checked_add(shares_to_mint).unwrap();
-    // Split incoming capital: 50% Kamino liquidity, 50% Marginfi collateral
-    let split_capital = amount / 2;
-    strategy.kamino_supplied_amount = strategy.kamino_supplied_amount.checked_add(split_capital).unwrap();
-    strategy.marginfi_collateral_amount = strategy.marginfi_collateral_amount.checked_add(split_capital).unwrap();
-
-    strategy.is_locked = 0;
     Ok(())
 }

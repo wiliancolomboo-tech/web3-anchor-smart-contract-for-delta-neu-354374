@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  aegis-keeper:
+    build:
+      context: ./keeper
+      dockerfile: Dockerfile
+    container_name: aegis-delta-neutral-keeper
+    restart: always
+    environment:
+      - SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+      - PROGRAM_ID=AegisDeltaNeutrav11111111111111111111111111
+      - KEEPER_KEYPAIR_PATH=/secrets/keeper-keypair.json
+      - DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your/webhook/url
+      - RESEND_API_KEY=re_test_000000000000000000000000
+      - ALERT_EMAIL=security@aegisfinance.io
+    volumes:
+      - ./secrets:/secrets:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"

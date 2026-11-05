@@ -2,285 +2,241 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use pyth_sdk_solana::load_price_feed_from_account_info;
 
-declare_id!("Aegis11111111111111111111111111111111111111");
+declare_id!("DeltaRouter1111111111111111111111111111111111");
 
+pub const VAULT_SEED: &[u8] = b"delta_vault";
+pub const AUTHORITY_SEED: &[u8] = b"vault_authority";
+pub const MAX_PRICE_AGE_SECONDS: u64 = 60;
+pub const MAX_DELTA_TOLERANCE_BPS: u64 = 75; // 0.75%
 pub const BPS_DENOMINATOR: u64 = 10_000;
-pub const MAX_ALLOWED_DRIFT_BPS: u64 = 300; // 3.00% delta drift maximum
-pub const VAULT_SEED: &[u8] = b"aegis_vault";
-pub const AUTHORITY_SEED: &[u8] = b"aegis_authority";
 
 #[program]
-pub mod aegis_delta_router {
+pub mod delta_neutral_router {
     use super::*;
 
-    pub fn initialize_strategy(
-        ctx: Context<InitializeStrategy>,
+    /// Initializes a new Delta-Neutral Vault targeting Kamino & Marginfi
+    pub fn initialize_vault(
+        ctx: Context<InitializeVault>,
         target_leverage_bps: u64,
-        max_slippage_bps: u64,
-        drift_threshold_bps: u64,
+        rebalance_threshold_bps: u64,
     ) -> Result<()> {
-        require!(
-            drift_threshold_bps <= MAX_ALLOWED_DRIFT_BPS,
-            AegisError::DriftThresholdTooHigh
-        );
-        require!(target_leverage_bps <= 30_000, AegisError::LeverageExceedsSafetyCap); // Max 3x
+        require!(target_leverage_bps >= 10_000, RouterError::InvalidLeverage);
+        require!(rebalance_threshold_bps <= 1_000, RouterError::InvalidThreshold);
 
-        let strategy = &mut ctx.accounts.strategy_vault;
-        strategy.admin = ctx.accounts.admin.key();
-        strategy.keeper = ctx.accounts.keeper.key();
-        strategy.collateral_mint = ctx.accounts.collateral_mint.key();
-        strategy.debt_mint = ctx.accounts.debt_mint.key();
-        strategy.kamino_vault = ctx.accounts.kamino_vault.key();
-        strategy.marginfi_account = ctx.accounts.marginfi_account.key();
-        strategy.target_leverage_bps = target_leverage_bps;
-        strategy.max_slippage_bps = max_slippage_bps;
-        strategy.drift_threshold_bps = drift_threshold_bps;
-        strategy.total_deposited_collateral = 0;
-        strategy.active_debt_balance = 0;
-        strategy.is_paused = false;
-        strategy.vault_bump = ctx.bumps.strategy_vault;
-        strategy.authority_bump = ctx.bumps.vault_authority;
+        let vault = &mut ctx.accounts.vault_state;
+        vault.admin = ctx.accounts.admin.key();
+        vault.deposit_mint = ctx.accounts.deposit_mint.key();
+        vault.hedged_mint = ctx.accounts.hedged_mint.key();
+        vault.kamino_reserve = ctx.accounts.kamino_reserve.key();
+        vault.marginfi_bank = ctx.accounts.marginfi_bank.key();
+        vault.pyth_price_feed = ctx.accounts.pyth_price_feed.key();
+        vault.target_leverage_bps = target_leverage_bps;
+        vault.rebalance_threshold_bps = rebalance_threshold_bps;
+        vault.bump = ctx.bumps.vault_state;
+        vault.authority_bump = ctx.bumps.vault_authority;
+        vault.total_usdc_deposited = 0;
+        vault.total_hedged_borrowed = 0;
+        vault.is_frozen = false;
 
-        emit!(StrategyInitializedEvent {
-            admin: strategy.admin,
-            collateral_mint: strategy.collateral_mint,
-            debt_mint: strategy.debt_mint,
-            target_leverage_bps,
+        emit!(VaultInitializedEvent {
+            admin: vault.admin,
+            vault: vault.key(),
+            timestamp: Clock::get()?.unix_timestamp,
         });
 
         Ok(())
     }
 
-    pub fn deposit_and_route(
-        ctx: Context<DepositAndRoute>,
-        collateral_amount: u64,
-        min_shares_expected: u64,
-    ) -> Result<()> {
-        let strategy = &mut ctx.accounts.strategy_vault;
-        require!(!strategy.is_paused, AegisError::StrategyPaused);
-        require!(collateral_amount > 0, AegisError::ZeroAmount);
+    /// Deposits USDC into the vault, automatically deploying collateral to Kamino 
+    /// and executing the proportional hedge on Marginfi.
+    pub fn deposit_and_hedge(ctx: Context<DepositAndHedge>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.vault_state.is_frozen, RouterError::VaultIsFrozen);
+        require!(amount > 0, RouterError::ZeroDepositAmount);
 
-        // 1. Transfer collateral from depositor to vault
+        // 1. Enforce Oracle Validity
+        let clock = Clock::get()?;
+        let pyth_price = validate_and_fetch_oracle_price(
+            &ctx.accounts.pyth_price_feed,
+            clock.unix_timestamp,
+        )?;
+
+        // 2. Transfer USDC from depositor to program-controlled vault token account
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from: ctx.accounts.user_collateral_ata.to_account_info(),
-                to: ctx.accounts.vault_collateral_ata.to_account_info(),
-                authority: ctx.accounts.user.to_account_info(),
+                from: ctx.accounts.user_usdc_ata.to_account_info(),
+                to: ctx.accounts.vault_usdc_ata.to_account_info(),
+                authority: ctx.accounts.depositor.to_account_info(),
             },
         );
-        token::transfer(transfer_ctx, collateral_amount)?;
+        token::transfer(transfer_ctx, amount)?;
 
-        // 2. Fetch Pyth oracle prices to validate asset valuations
-        let price_feed_collateral = load_price_feed_from_account_info(
-            &ctx.accounts.collateral_pyth_price_feed.to_account_info()
-        ).map_err(|_| AegisError::InvalidOraclePrice)?;
-        
-        let current_time = Clock::get()?.unix_timestamp;
-        let collateral_price = price_feed_collateral
-            .get_price_no_older_than(current_time, 60)
-            .ok_or(AegisError::StalePriceOracle)?;
+        // 3. Compute Hedge Requirement: Hedged Asset Amount = (Amount * Target Leverage) / Price
+        // Using base 10^6 for USDC and 10^9 for Hedged Asset (e.g., SOL)
+        let delta_neutral_borrow_units = compute_hedged_borrow_units(
+            amount,
+            pyth_price,
+            ctx.accounts.vault_state.target_leverage_bps,
+        )?;
 
-        require!(collateral_price.price > 0, AegisError::InvalidOraclePrice);
+        // 4. CPI to Kamino: Deposit USDC Liquidity
+        execute_kamino_deposit(
+            &ctx.accounts.kamino_program,
+            &ctx.accounts.kamino_reserve,
+            &ctx.accounts.vault_usdc_ata,
+            &ctx.accounts.vault_authority,
+            &ctx.accounts.kamino_collateral_ata,
+            amount,
+            ctx.accounts.vault_state.bump,
+        )?;
 
-        // 3. Execute CPI: Supply Spot Leg to Kamino Liquidity Program
-        let authority_seeds: &[&[&[u8]]] = &[&[
-            AUTHORITY_SEED,
-            &[strategy.authority_bump],
-        ]];
+        // 5. CPI to Marginfi: Open/Increase Hedged Asset Borrow Position
+        execute_marginfi_borrow(
+            &ctx.accounts.marginfi_program,
+            &ctx.accounts.marginfi_bank,
+            &ctx.accounts.marginfi_account,
+            &ctx.accounts.vault_authority,
+            &ctx.accounts.vault_hedged_ata,
+            delta_neutral_borrow_units,
+            ctx.accounts.vault_state.bump,
+        )?;
 
-        let kamino_cpi_accounts = KaminoDepositAccounts {
-            kamino_program: ctx.accounts.kamino_program.to_account_info(),
-            vault: ctx.accounts.kamino_vault.to_account_info(),
-            vault_authority: ctx.accounts.vault_authority.to_account_info(),
-            token_vault: ctx.accounts.vault_collateral_ata.to_account_info(),
-            token_program: ctx.accounts.token_program.to_account_info(),
-        };
-        kamino_cpi_accounts.execute_deposit(collateral_amount, authority_seeds)?;
+        // 6. Update Accounting State
+        let vault = &mut ctx.accounts.vault_state;
+        vault.total_usdc_deposited = vault.total_usdc_deposited.checked_add(amount).unwrap();
+        vault.total_hedged_borrowed = vault
+            .total_hedged_borrowed
+            .checked_add(delta_neutral_borrow_units)
+            .unwrap();
 
-        // 4. Execute CPI: Open Synthetic Short / Borrow on Marginfi Core Program
-        let marginfi_cpi_accounts = MarginfiBorrowAccounts {
-            marginfi_program: ctx.accounts.marginfi_program.to_account_info(),
-            marginfi_account: ctx.accounts.marginfi_account.to_account_info(),
-            vault_authority: ctx.accounts.vault_authority.to_account_info(),
-            marginfi_bank: ctx.accounts.marginfi_bank.to_account_info(),
-            destination_ata: ctx.accounts.vault_debt_ata.to_account_info(),
-            token_program: ctx.accounts.token_program.to_account_info(),
-        };
-
-        // Delta-neutral balance: calculate hedge size based on leverage target
-        let required_borrow = (collateral_amount as u128)
-            .checked_mul(strategy.target_leverage_bps as u128)
-            .ok_or(AegisError::MathOverflow)?
-            .checked_div(BPS_DENOMINATOR as u128)
-            .ok_or(AegisError::MathOverflow)? as u64;
-
-        marginfi_cpi_accounts.execute_borrow(required_borrow, authority_seeds)?;
-
-        // 5. Update Internal Accounting
-        strategy.total_deposited_collateral = strategy
-            .total_deposited_collateral
-            .checked_add(collateral_amount)
-            .ok_or(AegisError::MathOverflow)?;
-
-        strategy.active_debt_balance = strategy
-            .active_debt_balance
-            .checked_add(required_borrow)
-            .ok_or(AegisError::MathOverflow)?;
-
-        require!(
-            strategy.total_deposited_collateral >= min_shares_expected,
-            AegisError::SlippageExceeded
-        );
-
-        emit!(PositionUpdatedEvent {
-            vault: strategy.key(),
-            collateral_locked: strategy.total_deposited_collateral,
-            active_debt: strategy.active_debt_balance,
-            current_timestamp: current_time,
+        emit!(PositionHedgedEvent {
+            depositor: ctx.accounts.depositor.key(),
+            amount_deposited: amount,
+            hedged_borrowed_units: delta_neutral_borrow_units,
+            oracle_price: pyth_price,
+            timestamp: clock.unix_timestamp,
         });
 
         Ok(())
     }
 
-    pub fn rebalance_strategy(
-        ctx: Context<RebalanceStrategy>,
-        rebalance_debt_amount: u64,
-        is_reduce_debt: bool,
-    ) -> Result<()> {
-        let strategy = &mut ctx.accounts.strategy_vault;
-        require!(!strategy.is_paused, AegisError::StrategyPaused);
+    /// Autonomous keeper instruction: rebalance the delta between Kamino collateral & Marginfi borrow
+    pub fn rebalance_vault(ctx: Context<RebalanceVault>) -> Result<()> {
+        let clock = Clock::get()?;
+        let pyth_price = validate_and_fetch_oracle_price(
+            &ctx.accounts.pyth_price_feed,
+            clock.unix_timestamp,
+        )?;
 
-        let current_time = Clock::get()?.unix_timestamp;
+        let vault = &mut ctx.accounts.vault_state;
+        require!(!vault.is_frozen, RouterError::VaultIsFrozen);
 
-        // Price Feed validation via Pyth
-        let collateral_feed = load_price_feed_from_account_info(
-            &ctx.accounts.collateral_pyth_price_feed.to_account_info()
-        ).map_err(|_| AegisError::InvalidOraclePrice)?;
-        let col_price = collateral_feed
-            .get_price_no_older_than(current_time, 60)
-            .ok_or(AegisError::StalePriceOracle)?;
+        // Theoretical short required = (total_usdc_deposited * target_leverage) / price
+        let target_hedged_borrow = compute_hedged_borrow_units(
+            vault.total_usdc_deposited,
+            pyth_price,
+            vault.target_leverage_bps,
+        )?;
 
-        let debt_feed = load_price_feed_from_account_info(
-            &ctx.accounts.debt_pyth_price_feed.to_account_info()
-        ).map_err(|_| AegisError::InvalidOraclePrice)?;
-        let debt_price = debt_feed
-            .get_price_no_older_than(current_time, 60)
-            .ok_or(AegisError::StalePriceOracle)?;
+        let current_borrow = vault.total_hedged_borrowed;
+        let delta_diff = if target_hedged_borrow >= current_borrow {
+            target_hedged_borrow - current_borrow
+        } else {
+            current_borrow - target_hedged_borrow
+        };
 
-        // Quantify Delta Drift: delta = (spot_val - hedge_val) / spot_val
-        let spot_value_usd = (strategy.total_deposited_collateral as i128)
-            .checked_mul(col_price.price as i128)
-            .ok_or(AegisError::MathOverflow)?;
-
-        let hedge_value_usd = (strategy.active_debt_balance as i128)
-            .checked_mul(debt_price.price as i128)
-            .ok_or(AegisError::MathOverflow)?;
-
-        let drift_usd = spot_value_usd.checked_sub(hedge_value_usd).ok_or(AegisError::MathOverflow)?.abs();
-        let drift_bps = ((drift_usd as u128)
+        // Check if delta deviation exceeds threshold
+        let deviation_bps = (delta_diff as u128)
             .checked_mul(BPS_DENOMINATOR as u128)
-            .ok_or(AegisError::MathOverflow)?
-            .checked_div(spot_value_usd.abs() as u128)
-            .unwrap_or(0)) as u64;
+            .unwrap()
+            .checked_div(target_hedged_borrow as u128)
+            .unwrap() as u64;
 
         require!(
-            drift_bps >= strategy.drift_threshold_bps,
-            AegisError::RebalanceNotRequired
+            deviation_bps >= vault.rebalance_threshold_bps,
+            RouterError::RebalanceNotNeeded
         );
 
-        let authority_seeds: &[&[&[u8]]] = &[&[
-            AUTHORITY_SEED,
-            &[strategy.authority_bump],
-        ]];
-
-        if is_reduce_debt {
-            // Repay debt on Marginfi
-            let repay_accounts = MarginfiRepayAccounts {
-                marginfi_program: ctx.accounts.marginfi_program.to_account_info(),
-                marginfi_account: ctx.accounts.marginfi_account.to_account_info(),
-                vault_authority: ctx.accounts.vault_authority.to_account_info(),
-                marginfi_bank: ctx.accounts.marginfi_bank.to_account_info(),
-                source_debt_ata: ctx.accounts.vault_debt_ata.to_account_info(),
-                token_program: ctx.accounts.token_program.to_account_info(),
-            };
-            repay_accounts.execute_repay(rebalance_debt_amount, authority_seeds)?;
-            strategy.active_debt_balance = strategy
-                .active_debt_balance
-                .saturating_sub(rebalance_debt_amount);
+        if target_hedged_borrow > current_borrow {
+            // Need to borrow more to maintain delta neutrality
+            let to_borrow = target_hedged_borrow - current_borrow;
+            execute_marginfi_borrow(
+                &ctx.accounts.marginfi_program,
+                &ctx.accounts.marginfi_bank,
+                &ctx.accounts.marginfi_account,
+                &ctx.accounts.vault_authority,
+                &ctx.accounts.vault_hedged_ata,
+                to_borrow,
+                vault.bump,
+            )?;
+            vault.total_hedged_borrowed = target_hedged_borrow;
         } else {
-            // Increase borrow on Marginfi
-            let borrow_accounts = MarginfiBorrowAccounts {
-                marginfi_program: ctx.accounts.marginfi_program.to_account_info(),
-                marginfi_account: ctx.accounts.marginfi_account.to_account_info(),
-                vault_authority: ctx.accounts.vault_authority.to_account_info(),
-                marginfi_bank: ctx.accounts.marginfi_bank.to_account_info(),
-                destination_ata: ctx.accounts.vault_debt_ata.to_account_info(),
-                token_program: ctx.accounts.token_program.to_account_info(),
-            };
-            borrow_accounts.execute_borrow(rebalance_debt_amount, authority_seeds)?;
-            strategy.active_debt_balance = strategy
-                .active_debt_balance
-                .checked_add(rebalance_debt_amount)
-                .ok_or(AegisError::MathOverflow)?;
+            // Need to repay excess hedge
+            let to_repay = current_borrow - target_hedged_borrow;
+            execute_marginfi_repay(
+                &ctx.accounts.marginfi_program,
+                &ctx.accounts.marginfi_bank,
+                &ctx.accounts.marginfi_account,
+                &ctx.accounts.vault_authority,
+                &ctx.accounts.vault_hedged_ata,
+                to_repay,
+                vault.bump,
+            )?;
+            vault.total_hedged_borrowed = target_hedged_borrow;
         }
 
-        emit!(StrategyRebalancedEvent {
-            vault: strategy.key(),
-            new_debt_balance: strategy.active_debt_balance,
-            calculated_drift_bps: drift_bps,
-            timestamp: current_time,
+        emit!(RebalancedEvent {
+            deviation_bps,
+            new_hedged_borrow: vault.total_hedged_borrowed,
+            oracle_price: pyth_price,
+            timestamp: clock.unix_timestamp,
         });
 
         Ok(())
     }
 
-    pub fn set_emergency_pause(ctx: Context<EmergencyControl>, paused: bool) -> Result<()> {
-        let strategy = &mut ctx.accounts.strategy_vault;
-        strategy.is_paused = paused;
-        emit!(EmergencyPauseUpdatedEvent {
-            vault: strategy.key(),
-            is_paused: paused,
-            operator: ctx.accounts.admin.key(),
-        });
+    /// Admin Emergency Freeze / Unfreeze
+    pub fn set_vault_frozen(ctx: Context<AdminControl>, frozen: bool) -> Result<()> {
+        let vault = &mut ctx.accounts.vault_state;
+        vault.is_frozen = frozen;
         Ok(())
     }
 }
 
-// --------------------------------------------------------------------------------
-// Account Structures
-// --------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------
+// Account Structs
+// ---------------------------------------------------------------------------------
 
 #[derive(Accounts)]
-pub struct InitializeStrategy<'info> {
+pub struct InitializeVault<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
     #[account(
         init,
         payer = admin,
-        space = 8 + StrategyVault::INIT_SPACE,
-        seeds = [VAULT_SEED, collateral_mint.key().as_ref(), debt_mint.key().as_ref()],
+        space = 8 + VaultState::INIT_SPACE,
+        seeds = [VAULT_SEED, deposit_mint.key().as_ref(), hedged_mint.key().as_ref()],
         bump
     )]
-    pub strategy_vault: Account<'info, StrategyVault>,
+    pub vault_state: Account<'info, VaultState>,
 
-    /// CHECK: PDA acting as the cross-CPI vault authority
+    /// CHECK: PDA acting as the decentralized vault authority for signing CPIs
     #[account(
-        seeds = [AUTHORITY_SEED],
+        seeds = [AUTHORITY_SEED, vault_state.key().as_ref()],
         bump
     )]
     pub vault_authority: AccountInfo<'info>,
 
-    pub collateral_mint: Account<'info, Mint>,
-    pub debt_mint: Account<'info, Mint>,
+    pub deposit_mint: Account<'info, Mint>,
+    pub hedged_mint: Account<'info, Mint>,
 
-    /// CHECK: Verified against Kamino program
-    pub kamino_vault: AccountInfo<'info>,
-    /// CHECK: Verified against Marginfi program
-    pub marginfi_account: AccountInfo<'info>,
-
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    /// CHECK: Authorized automated rebalancer bot address
-    pub keeper: AccountInfo<'info>,
+    /// CHECK: Validated Kamino reserve account
+    pub kamino_reserve: AccountInfo<'info>,
+    /// CHECK: Validated Marginfi bank account
+    pub marginfi_bank: AccountInfo<'info>,
+    /// CHECK: Verified Pyth Network Oracle account
+    pub pyth_price_feed: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
@@ -288,321 +244,348 @@ pub struct InitializeStrategy<'info> {
 }
 
 #[derive(Accounts)]
-pub struct DepositAndRoute<'info> {
+pub struct DepositAndHedge<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
     #[account(
         mut,
-        has_one = collateral_mint,
-        has_one = kamino_vault,
-        has_one = marginfi_account,
-        seeds = [VAULT_SEED, collateral_mint.key().as_ref(), strategy_vault.debt_mint.as_ref()],
-        bump = strategy_vault.vault_bump
+        seeds = [VAULT_SEED, vault_state.deposit_mint.as_ref(), vault_state.hedged_mint.as_ref()],
+        bump = vault_state.bump
     )]
-    pub strategy_vault: Account<'info, StrategyVault>,
+    pub vault_state: Account<'info, VaultState>,
 
-    /// CHECK: PDA authority
+    /// CHECK: Vault PDA authority
     #[account(
-        seeds = [AUTHORITY_SEED],
-        bump = strategy_vault.authority_bump
+        seeds = [AUTHORITY_SEED, vault_state.key().as_ref()],
+        bump = vault_state.authority_bump
     )]
     pub vault_authority: AccountInfo<'info>,
 
-    pub collateral_mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        constraint = user_usdc_ata.owner == depositor.key(),
+        constraint = user_usdc_ata.mint == vault_state.deposit_mint
+    )]
+    pub user_usdc_ata: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        constraint = user_collateral_ata.owner == user.key(),
-        constraint = user_collateral_ata.mint == collateral_mint.key()
+        constraint = vault_usdc_ata.owner == vault_authority.key(),
+        constraint = vault_usdc_ata.mint == vault_state.deposit_mint
     )]
-    pub user_collateral_ata: Account<'info, TokenAccount>,
+    pub vault_usdc_ata: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        constraint = vault_collateral_ata.owner == vault_authority.key(),
-        constraint = vault_collateral_ata.mint == collateral_mint.key()
+        constraint = vault_hedged_ata.owner == vault_authority.key(),
+        constraint = vault_hedged_ata.mint == vault_state.hedged_mint
     )]
-    pub vault_collateral_ata: Account<'info, TokenAccount>,
+    pub vault_hedged_ata: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        constraint = vault_debt_ata.owner == vault_authority.key()
+        constraint = kamino_collateral_ata.owner == vault_authority.key()
     )]
-    pub vault_debt_ata: Account<'info, TokenAccount>,
+    pub kamino_collateral_ata: Account<'info, TokenAccount>,
 
-    /// CHECK: Pyth Oracle for Collateral Price Verification
-    pub collateral_pyth_price_feed: AccountInfo<'info>,
+    /// CHECK: Pyth Price Feed for hedged asset
+    #[account(address = vault_state.pyth_price_feed)]
+    pub pyth_price_feed: AccountInfo<'info>,
 
     /// CHECK: Kamino Program
     pub kamino_program: AccountInfo<'info>,
+    /// CHECK: Kamino Reserve Account
+    #[account(mut, address = vault_state.kamino_reserve)]
+    pub kamino_reserve: AccountInfo<'info>,
+
     /// CHECK: Marginfi Program
     pub marginfi_program: AccountInfo<'info>,
-
-    /// CHECK: Kamino Strategy Target
-    #[account(mut)]
-    pub kamino_vault: AccountInfo<'info>,
-    /// CHECK: Marginfi Account
+    /// CHECK: Marginfi Bank Account
+    #[account(mut, address = vault_state.marginfi_bank)]
+    pub marginfi_bank: AccountInfo<'info>,
+    /// CHECK: Marginfi Account PDA
     #[account(mut)]
     pub marginfi_account: AccountInfo<'info>,
-    /// CHECK: Marginfi Bank
-    #[account(mut)]
-    pub marginfi_bank: AccountInfo<'info>,
 
-    pub user: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
-pub struct RebalanceStrategy<'info> {
+pub struct RebalanceVault<'info> {
+    #[account(mut)]
+    pub keeper: Signer<'info>,
+
     #[account(
         mut,
-        seeds = [VAULT_SEED, strategy_vault.collateral_mint.as_ref(), strategy_vault.debt_mint.as_ref()],
-        bump = strategy_vault.vault_bump,
-        has_one = keeper
+        seeds = [VAULT_SEED, vault_state.deposit_mint.as_ref(), vault_state.hedged_mint.as_ref()],
+        bump = vault_state.bump
     )]
-    pub strategy_vault: Account<'info, StrategyVault>,
+    pub vault_state: Account<'info, VaultState>,
 
-    /// CHECK: PDA authority
+    /// CHECK: Vault PDA authority
     #[account(
-        seeds = [AUTHORITY_SEED],
-        bump = strategy_vault.authority_bump
+        seeds = [AUTHORITY_SEED, vault_state.key().as_ref()],
+        bump = vault_state.authority_bump
     )]
     pub vault_authority: AccountInfo<'info>,
 
     #[account(
         mut,
-        constraint = vault_debt_ata.owner == vault_authority.key()
+        constraint = vault_hedged_ata.owner == vault_authority.key(),
+        constraint = vault_hedged_ata.mint == vault_state.hedged_mint
     )]
-    pub vault_debt_ata: Account<'info, TokenAccount>,
+    pub vault_hedged_ata: Account<'info, TokenAccount>,
 
-    /// CHECK: Pyth Oracle for Collateral
-    pub collateral_pyth_price_feed: AccountInfo<'info>,
-    /// CHECK: Pyth Oracle for Debt
-    pub debt_pyth_price_feed: AccountInfo<'info>,
+    /// CHECK: Pyth Price Feed
+    #[account(address = vault_state.pyth_price_feed)]
+    pub pyth_price_feed: AccountInfo<'info>,
 
     /// CHECK: Marginfi Program
     pub marginfi_program: AccountInfo<'info>,
+    /// CHECK: Marginfi Bank
+    #[account(mut, address = vault_state.marginfi_bank)]
+    pub marginfi_bank: AccountInfo<'info>,
     /// CHECK: Marginfi Account
     #[account(mut)]
     pub marginfi_account: AccountInfo<'info>,
-    /// CHECK: Marginfi Bank
-    #[account(mut)]
-    pub marginfi_bank: AccountInfo<'info>,
 
-    pub keeper: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
-pub struct EmergencyControl<'info> {
+pub struct AdminControl<'info> {
     #[account(
         mut,
-        has_one = admin,
-        seeds = [VAULT_SEED, strategy_vault.collateral_mint.as_ref(), strategy_vault.debt_mint.as_ref()],
-        bump = strategy_vault.vault_bump
+        has_one = admin @ RouterError::UnauthorizedAdmin
     )]
-    pub strategy_vault: Account<'info, StrategyVault>,
+    pub vault_state: Account<'info, VaultState>,
     pub admin: Signer<'info>,
 }
 
-// --------------------------------------------------------------------------------
-// Data State PDA
-// --------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------
+// State & Events
+// ---------------------------------------------------------------------------------
 
 #[account]
 #[derive(InitSpace)]
-pub struct StrategyVault {
+pub struct VaultState {
     pub admin: Pubkey,
-    pub keeper: Pubkey,
-    pub collateral_mint: Pubkey,
-    pub debt_mint: Pubkey,
-    pub kamino_vault: Pubkey,
-    pub marginfi_account: Pubkey,
-    pub total_deposited_collateral: u64,
-    pub active_debt_balance: u64,
+    pub deposit_mint: Pubkey,
+    pub hedged_mint: Pubkey,
+    pub kamino_reserve: Pubkey,
+    pub marginfi_bank: Pubkey,
+    pub pyth_price_feed: Pubkey,
     pub target_leverage_bps: u64,
-    pub max_slippage_bps: u64,
-    pub drift_threshold_bps: u64,
-    pub is_paused: bool,
-    pub vault_bump: u8,
+    pub rebalance_threshold_bps: u64,
+    pub total_usdc_deposited: u64,
+    pub total_hedged_borrowed: u64,
+    pub bump: u8,
     pub authority_bump: u8,
+    pub is_frozen: bool,
 }
-
-// --------------------------------------------------------------------------------
-// CPI Mock Executions for Kamino and Marginfi
-// --------------------------------------------------------------------------------
-
-pub struct KaminoDepositAccounts<'info> {
-    pub kamino_program: AccountInfo<'info>,
-    pub vault: AccountInfo<'info>,
-    pub vault_authority: AccountInfo<'info>,
-    pub token_vault: AccountInfo<'info>,
-    pub token_program: AccountInfo<'info>,
-}
-
-impl<'info> KaminoDepositAccounts<'info> {
-    pub fn execute_deposit(&self, amount: u64, seeds: &[&[&[u8]]]) -> Result<()> {
-        let ix = solana_program::instruction::Instruction {
-            program_id: *self.kamino_program.key,
-            accounts: vec![
-                AccountMeta::new(self.vault.key(), false),
-                AccountMeta::new_readonly(self.vault_authority.key(), true),
-                AccountMeta::new(self.token_vault.key(), false),
-                AccountMeta::new_readonly(self.token_program.key(), false),
-            ],
-            data: {
-                let mut data = vec![0x1a, 0xbc, 0x4f, 0x90]; // Selector: deposit
-                data.extend_from_slice(&amount.to_le_bytes());
-                data
-            },
-        };
-        solana_program::program::invoke_signed(
-            &ix,
-            &[
-                self.vault.clone(),
-                self.vault_authority.clone(),
-                self.token_vault.clone(),
-                self.token_program.clone(),
-            ],
-            seeds,
-        )?;
-        Ok(())
-    }
-}
-
-pub struct MarginfiBorrowAccounts<'info> {
-    pub marginfi_program: AccountInfo<'info>,
-    pub marginfi_account: AccountInfo<'info>,
-    pub vault_authority: AccountInfo<'info>,
-    pub marginfi_bank: AccountInfo<'info>,
-    pub destination_ata: AccountInfo<'info>,
-    pub token_program: AccountInfo<'info>,
-}
-
-impl<'info> MarginfiBorrowAccounts<'info> {
-    pub fn execute_borrow(&self, amount: u64, seeds: &[&[&[u8]]]) -> Result<()> {
-        let ix = solana_program::instruction::Instruction {
-            program_id: *self.marginfi_program.key,
-            accounts: vec![
-                AccountMeta::new(self.marginfi_account.key(), false),
-                AccountMeta::new_readonly(self.vault_authority.key(), true),
-                AccountMeta::new(self.marginfi_bank.key(), false),
-                AccountMeta::new(self.destination_ata.key(), false),
-                AccountMeta::new_readonly(self.token_program.key(), false),
-            ],
-            data: {
-                let mut data = vec![0x3b, 0x11, 0x92, 0xea]; // Selector: borrow
-                data.extend_from_slice(&amount.to_le_bytes());
-                data
-            },
-        };
-        solana_program::program::invoke_signed(
-            &ix,
-            &[
-                self.marginfi_account.clone(),
-                self.vault_authority.clone(),
-                self.marginfi_bank.clone(),
-                self.destination_ata.clone(),
-                self.token_program.clone(),
-            ],
-            seeds,
-        )?;
-        Ok(())
-    }
-}
-
-pub struct MarginfiRepayAccounts<'info> {
-    pub marginfi_program: AccountInfo<'info>,
-    pub marginfi_account: AccountInfo<'info>,
-    pub vault_authority: AccountInfo<'info>,
-    pub marginfi_bank: AccountInfo<'info>,
-    pub source_debt_ata: AccountInfo<'info>,
-    pub token_program: AccountInfo<'info>,
-}
-
-impl<'info> MarginfiRepayAccounts<'info> {
-    pub fn execute_repay(&self, amount: u64, seeds: &[&[&[u8]]]) -> Result<()> {
-        let ix = solana_program::instruction::Instruction {
-            program_id: *self.marginfi_program.key,
-            accounts: vec![
-                AccountMeta::new(self.marginfi_account.key(), false),
-                AccountMeta::new_readonly(self.vault_authority.key(), true),
-                AccountMeta::new(self.marginfi_bank.key(), false),
-                AccountMeta::new(self.source_debt_ata.key(), false),
-                AccountMeta::new_readonly(self.token_program.key(), false),
-            ],
-            data: {
-                let mut data = vec![0x7f, 0x4a, 0x22, 0x18]; // Selector: repay
-                data.extend_from_slice(&amount.to_le_bytes());
-                data
-            },
-        };
-        solana_program::program::invoke_signed(
-            &ix,
-            &[
-                self.marginfi_account.clone(),
-                self.vault_authority.clone(),
-                self.marginfi_bank.clone(),
-                self.source_debt_ata.clone(),
-                self.token_program.clone(),
-            ],
-            seeds,
-        )?;
-        Ok(())
-    }
-}
-
-// --------------------------------------------------------------------------------
-// Events and Errors
-// --------------------------------------------------------------------------------
 
 #[event]
-pub struct StrategyInitializedEvent {
+pub struct VaultInitializedEvent {
     pub admin: Pubkey,
-    pub collateral_mint: Pubkey,
-    pub debt_mint: Pubkey,
-    pub target_leverage_bps: u64,
-}
-
-#[event]
-pub struct PositionUpdatedEvent {
     pub vault: Pubkey,
-    pub collateral_locked: u64,
-    pub active_debt: u64,
-    pub current_timestamp: i64,
-}
-
-#[event]
-pub struct StrategyRebalancedEvent {
-    pub vault: Pubkey,
-    pub new_debt_balance: u64,
-    pub calculated_drift_bps: u64,
     pub timestamp: i64,
 }
 
 #[event]
-pub struct EmergencyPauseUpdatedEvent {
-    pub vault: Pubkey,
-    pub is_paused: bool,
-    pub operator: Pubkey,
+pub struct PositionHedgedEvent {
+    pub depositor: Pubkey,
+    pub amount_deposited: u64,
+    pub hedged_borrowed_units: u64,
+    pub oracle_price: i64,
+    pub timestamp: i64,
 }
 
+#[event]
+pub struct RebalancedEvent {
+    pub deviation_bps: u64,
+    pub new_hedged_borrow: u64,
+    pub oracle_price: i64,
+    pub timestamp: i64,
+}
+
+// ---------------------------------------------------------------------------------
+// Errors & Math Utility
+// ---------------------------------------------------------------------------------
+
 #[error_code]
-pub enum AegisError {
-    #[msg("Strategy execution is paused by emergency multisig.")]
-    StrategyPaused,
-    #[msg("Specified drift threshold exceeds the maximum system cap (3%).")]
-    DriftThresholdTooHigh,
-    #[msg("Target leverage exceeds enterprise protocol safety bounds (3x).")]
-    LeverageExceedsSafetyCap,
-    #[msg("Input amount must be strictly greater than zero.")]
-    ZeroAmount,
-    #[msg("Execution slippage exceeded client threshold.")]
-    SlippageExceeded,
-    #[msg("Pyth price feed account failed to parse.")]
-    InvalidOraclePrice,
-    #[msg("Pyth price feed confidence intervals or latency threshold exceeded (stale).")]
-    StalePriceOracle,
-    #[msg("Delta drift is within the acceptable band; rebalance rejected to save fees.")]
-    RebalanceNotRequired,
-    #[msg("Checked math calculation encountered an overflow.")]
+pub enum RouterError {
+    #[msg("Stale or invalid Pyth oracle price feed.")]
+    StaleOracleFeed,
+    #[msg("Target leverage setting out of safe bounds [10000..30000].")]
+    InvalidLeverage,
+    #[msg("Rebalance threshold cannot exceed 1000 BPS (10%).")]
+    InvalidThreshold,
+    #[msg("Vault is currently frozen by administrator.")]
+    VaultIsFrozen,
+    #[msg("Deposit amount must be strictly greater than zero.")]
+    ZeroDepositAmount,
+    #[msg("Current delta deviation does not warrant rebalance invocation.")]
+    RebalanceNotNeeded,
+    #[msg("Signer does not possess administrator credentials.")]
+    UnauthorizedAdmin,
+    #[msg("Mathematical overflow or underflow in safe calculation.")]
     MathOverflow,
+}
+
+/// Parses and validates that Pyth oracle feed is current and confident
+pub fn validate_and_fetch_oracle_price(
+    price_account_info: &AccountInfo,
+    current_timestamp: i64,
+) -> Result<i64> {
+    let price_feed = load_price_feed_from_account_info(price_account_info)
+        .map_err(|_| RouterError::StaleOracleFeed)?;
+
+    let price = price_feed
+        .get_price_no_older_than(current_timestamp, MAX_PRICE_AGE_SECONDS)
+        .ok_or(RouterError::StaleOracleFeed)?;
+
+    require!(price.price > 0, RouterError::StaleOracleFeed);
+    Ok(price.price)
+}
+
+/// Normalizes USD value to hedged units (e.g. USDC (10^6) -> SOL (10^9))
+pub fn compute_hedged_borrow_units(
+    usdc_amount: u64,
+    pyth_price_expo8: i64,
+    leverage_bps: u64,
+) -> Result<u64> {
+    // pyth_price is typically base 10^-8 for SOL/USD
+    // Notional USD value = usdc_amount (6 decimals)
+    // SOL units = (USDC_amount * 10^9 * 10^8) / (price * 10^6)
+    let leveraged_usdc = (usdc_amount as u128)
+        .checked_mul(leverage_bps as u128)
+        .ok_or(RouterError::MathOverflow)?
+        .checked_div(BPS_DENOMINATOR as u128)
+        .ok_or(RouterError::MathOverflow)?;
+
+    let sol_units = leveraged_usdc
+        .checked_mul(1_000_000_000_000_000_000u128) // 10^18 scalar
+        .ok_or(RouterError::MathOverflow)?
+        .checked_div(pyth_price_expo8 as u128)
+        .ok_or(RouterError::MathOverflow)?
+        .checked_div(1_000_000u128) // eliminate USDC decimals
+        .ok_or(RouterError::MathOverflow)?;
+
+    Ok(sol_units as u64)
+}
+
+// ---------------------------------------------------------------------------------
+// Cross-Program Invocations (CPI)
+// ---------------------------------------------------------------------------------
+
+pub fn execute_kamino_deposit<'info>(
+    kamino_program: &AccountInfo<'info>,
+    kamino_reserve: &AccountInfo<'info>,
+    user_source_liquidity: &Account<'info, TokenAccount>,
+    authority: &AccountInfo<'info>,
+    destination_collateral: &Account<'info, TokenAccount>,
+    amount: u64,
+    bump: u8,
+) -> Result<()> {
+    // Kamino lending deposit instruction discriminator [145, 185, 237, 7, 108, 172, 85, 11]
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&[145, 185, 237, 7, 108, 172, 85, 11]);
+    data.extend_from_slice(&amount.to_le_bytes());
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: *kamino_program.key,
+        accounts: vec![
+            AccountMeta::new(user_source_liquidity.key(), false),
+            AccountMeta::new(destination_collateral.key(), false),
+            AccountMeta::new(*kamino_reserve.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+        ],
+        data,
+    };
+
+    let seeds = &[AUTHORITY_SEED, authority.key.as_ref(), &[bump]];
+    solana_program::program::invoke_signed(&ix, &[
+        kamino_program.clone(),
+        user_source_liquidity.to_account_info(),
+        destination_collateral.to_account_info(),
+        kamino_reserve.clone(),
+        authority.clone(),
+    ], &[seeds])?;
+
+    Ok(())
+}
+
+pub fn execute_marginfi_borrow<'info>(
+    marginfi_program: &AccountInfo<'info>,
+    marginfi_bank: &AccountInfo<'info>,
+    marginfi_account: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    destination_ata: &Account<'info, TokenAccount>,
+    amount: u64,
+    bump: u8,
+) -> Result<()> {
+    // Marginfi v2 borrow discriminator [229, 3, 201, 106, 111, 212, 170, 142]
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&[229, 3, 201, 106, 111, 212, 170, 142]);
+    data.extend_from_slice(&amount.to_le_bytes());
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: *marginfi_program.key,
+        accounts: vec![
+            AccountMeta::new(*marginfi_account.key, false),
+            AccountMeta::new(*marginfi_bank.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new(destination_ata.key(), false),
+        ],
+        data,
+    };
+
+    let seeds = &[AUTHORITY_SEED, authority.key.as_ref(), &[bump]];
+    solana_program::program::invoke_signed(&ix, &[
+        marginfi_program.clone(),
+        marginfi_account.clone(),
+        marginfi_bank.clone(),
+        authority.clone(),
+        destination_ata.to_account_info(),
+    ], &[seeds])?;
+
+    Ok(())
+}
+
+pub fn execute_marginfi_repay<'info>(
+    marginfi_program: &AccountInfo<'info>,
+    marginfi_bank: &AccountInfo<'info>,
+    marginfi_account: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    source_ata: &Account<'info, TokenAccount>,
+    amount: u64,
+    bump: u8,
+) -> Result<()> {
+    // Marginfi v2 repay discriminator [236, 179, 131, 184, 185, 17, 108, 14]
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&[236, 179, 131, 184, 185, 17, 108, 14]);
+    data.extend_from_slice(&amount.to_le_bytes());
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: *marginfi_program.key,
+        accounts: vec![
+            AccountMeta::new(*marginfi_account.key, false),
+            AccountMeta::new(*marginfi_bank.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new(source_ata.key(), false),
+        ],
+        data,
+    };
+
+    let seeds = &[AUTHORITY_SEED, authority.key.as_ref(), &[bump]];
+    solana_program::program::invoke_signed(&ix, &[
+        marginfi_program.clone(),
+        marginfi_account.clone(),
+        marginfi_bank.clone(),
+        authority.clone(),
+        source_ata.to_account_info(),
+    ], &[seeds])?;
+
+    Ok(())
 }

@@ -1,11 +1,33 @@
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                           SYSTEM METRICS AT A GLANCE                          │
-├───────────────────────┬───────────────────────────────┬───────────────────────┤
-│ Target Delta Exposure │ < 0.005 SOL (Dynamic Buffer)  │ Invariant Enforcement │
-├───────────────────────┼───────────────────────────────┼───────────────────────┤
-│ Max Permitted LTV     │ 68.00% (Marginfi Hard Cap)    │ Oracle Health Checks  │
-├───────────────────────┼───────────────────────────────┼───────────────────────┤
-│ Target Safe LTV       │ 50.00% - 55.00%               │ Auto-Rebalancing      │
-├───────────────────────┼───────────────────────────────┼───────────────────────┤
-│ Execution Profile     │ Under 185,000 Compute Units   │ Zero Dynamic Alloc    │
-└───────────────────────┴───────────────────────────────┴───────────────────────┘
++---------------------------------------------------------------------------------+
+|                                 AEGIS SYSTEM                                    |
+|                                                                                 |
+|  [Institutional Users]                                                          |
+|           |                                                                     |
+|    (USDC Deposit)                                                               |
+|           v                                                                     |
+|   +-------------------------------------------------------------------------+   |
+|   |                       Aegis Core Program (Anchor)                       |   |
+|   |   - Vault PDA Authority      - Delta Rebalancer Module                  |   |
+|   |   - Share Accounting         - Circuit Breaker Subsystem                |   |
+|   +-------------------------------------------------------------------------+   |
+|           |                                           |                         |
+|      (CPI Deposit)                               (CPI Borrow)                   |
+|           v                                           v                         |
+|   +-------------------+                       +-------------------+             |
+|   | Marginfi Protocol |                       |  Kamino Protocol  |             |
+|   | - Collateral Base |                       | - Target Reserve  |             |
+|   | - Borrow Account  |                       | - Yield Vault     |             |
+|   +-------------------+                       +-------------------+             |
+|           ^                                           ^                         |
+|           +---------------------+---------------------+                         |
+|                                 |                                               |
+|                    (Scheduled Keeper Rebalance)                                 |
+|                                 |                                               |
+|               +-----------------------------------+                             |
+|               |  Aegis Autonomous Automation Bot  |                             |
+|               +-----------------------------------+                             |
+|                    /                         \                                  |
+|         (Webhook Notifications)         (Urgent Alerts)                         |
+|                  v                             v                                |
+|       [Discord/Slack Channel]          [Resend API Gateway]                     |
++---------------------------------------------------------------------------------+

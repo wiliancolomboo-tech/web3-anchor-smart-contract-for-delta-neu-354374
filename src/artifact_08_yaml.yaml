@@ -1,19 +1,22 @@
-version: "3.9"
+version: "3.8"
 
 services:
-  aegis-rebalancer-daemon:
+  aura-keeper:
     build:
       context: .
       dockerfile: Dockerfile
     restart: always
     environment:
-      - SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-      - KEEPER_PRIVATE_KEY=${KEEPER_PRIVATE_KEY}
-      - PROGRAM_ID=Aegis11111111111111111111111111111111111111
-      - STRATEGY_VAULT_PUBKEY=${STRATEGY_VAULT_PUBKEY}
-      - ENTERPRISE_WEBHOOK_URL=${ENTERPRISE_WEBHOOK_URL}
+      - RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+      - PROGRAM_ID=AURAdnr7j8MvY2sE2CjS9rZ57oU8kGkQ3gZ7Y2r1aVR
+      - VAULT_STATE_PDA=YOUR_VAULT_STATE_PDA
+      - PYTH_FEED_ADDRESS=rec5EKMGg6vTXrkwYdWPfaPhysuphcB53EDDPWVAmfP
+      - DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_KEY
+      - RESEND_API_KEY=re_123456789
+      - ALERT_EMAIL=ops@aurafinance.io
+      - POLL_INTERVAL_MS=3000
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
+        max-size: "20m"
         max-file: "5"

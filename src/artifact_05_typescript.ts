@@ -1,128 +1,141 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { PublicKey, Keypair, Connection, clusterApiUrl } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import axios from "axios";
 import * as dotenv from "dotenv";
+import * as fs from "fs";
 
 dotenv.config();
 
-interface HealthPayload {
-  vault: string;
-  spotValueUsd: number;
-  hedgeValueUsd: number;
-  driftBps: number;
-  timestamp: string;
+interface VaultStateAccount {
+  admin: PublicKey;
+  depositMint: PublicKey;
+  hedgedMint: PublicKey;
+  kaminoReserve: PublicKey;
+  marginfiBank: PublicKey;
+  pythPriceFeed: PublicKey;
+  targetLeverageBps: anchor.BN;
+  rebalanceThresholdBps: anchor.BN;
+  totalUsdcDeposited: anchor.BN;
+  totalHedgedBorrowed: anchor.BN;
+  isFrozen: boolean;
 }
 
-export class AegisDeltaKeeper {
+class DeltaNeutralSentinel {
   private connection: Connection;
   private wallet: anchor.Wallet;
-  private program: Program;
+  private program: anchor.Program;
   private vaultPubkey: PublicKey;
-  private webhookUrl: string;
+  private discordWebhookUrl: string;
 
   constructor() {
-    const rpcUrl = process.env.SOLANA_RPC_URL || clusterApiUrl("devnet");
+    const rpcUrl = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
     this.connection = new Connection(rpcUrl, "confirmed");
 
-    const secretKey = JSON.parse(process.env.KEEPER_PRIVATE_KEY || "[]");
-    const keypair = Keypair.fromSecretKey(Uint8Array.from(secretKey));
-    this.wallet = new anchor.Wallet(keypair);
+    const keypairData = JSON.parse(
+      fs.readFileSync(process.env.KEEPER_KEYPAIR_PATH || "./keeper-wallet.json", "utf-8")
+    );
+    const keeperKeypair = Keypair.fromSecretKey(new Uint8Array(keypairData));
+    this.wallet = new anchor.Wallet(keeperKeypair);
 
     const provider = new anchor.AnchorProvider(this.connection, this.wallet, {
-      preflightCommitment: "confirmed",
+      commitment: "confirmed",
     });
     anchor.setProvider(provider);
 
-    // Anchor program IDL initialization
-    const programId = new PublicKey(process.env.PROGRAM_ID!);
-    const idl = JSON.parse(process.env.PROGRAM_IDL!);
-    this.program = new Program(idl, provider);
+    const idl = JSON.parse(fs.readFileSync("./target/idl/delta_neutral_router.json", "utf8"));
+    const programId = new PublicKey(process.env.ROUTER_PROGRAM_ID!);
+    this.program = new anchor.Program(idl, programId, provider);
 
-    this.vaultPubkey = new PublicKey(process.env.STRATEGY_VAULT_PUBKEY!);
-    this.webhookUrl = process.env.ENTERPRISE_WEBHOOK_URL || "";
+    this.vaultPubkey = new PublicKey(process.env.VAULT_STATE_PUBKEY!);
+    this.discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL || "";
   }
 
-  public async monitorAndRebalance(): Promise<void> {
-    console.log(`[AEGIS-DAEMON] Monitoring AegisDelta Vault: ${this.vaultPubkey.toBase58()}`);
-
-    setInterval(async () => {
+  public async startLoop(pollIntervalMs = 15000): Promise<void> {
+    console.log(`[SENTINEL] Active. Monitoring Vault: ${this.vaultPubkey.toBase58()}`);
+    while (true) {
       try {
-        const vaultAccount: any = await this.program.account.strategyVault.fetch(this.vaultPubkey);
-        
-        // Mock oracle price resolution (production reads from Pyth Client)
-        const collateralPriceUsd = 145.50; // SOL Price
-        const debtPriceUsd = 1.00;        // USDC Price
-
-        const spotUsd = (vaultAccount.totalDepositedCollateral.toNumber() / 1e9) * collateralPriceUsd;
-        const hedgeUsd = (vaultAccount.activeDebtBalance.toNumber() / 1e6) * debtPriceUsd;
-
-        const deltaDriftBps = Math.abs((spotUsd - hedgeUsd) / spotUsd) * 10000;
-        console.log(`[METRICS] Spot: $${spotUsd.toFixed(2)} | Hedge: $${hedgeUsd.toFixed(2)} | Drift: ${deltaDriftBps.toFixed(2)} bps`);
-
-        if (deltaDriftBps > vaultAccount.driftThresholdBps.toNumber()) {
-          console.warn(`[TRIGGER] Drift ${deltaDriftBps} bps exceeds threshold ${vaultAccount.driftThresholdBps.toNumber()} bps! Rebalancing...`);
-          await this.executeRebalance(spotUsd, hedgeUsd);
-        }
-
-        // Telemetry Heartbeat
-        await this.postEnterpriseTelemetry({
-          vault: this.vaultPubkey.toBase58(),
-          spotValueUsd: spotUsd,
-          hedgeValueUsd: hedgeUsd,
-          driftBps: deltaDriftBps,
-          timestamp: new Date().toISOString(),
-        });
+        await this.evaluateVaultHealth();
       } catch (err: any) {
-        console.error(`[ERROR] Daemon monitoring cycle failed: ${err.message}`);
+        console.error(`[SENTINEL ERROR] Loop exception:`, err.message);
+        await this.sendAlert("Vault Evaluation Failure", `Exception: ${err.message}`, 0xff0000);
       }
-    }, 15000); // 15s polling frequency
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
   }
 
-  private async executeRebalance(spotUsd: number, hedgeUsd: number): Promise<void> {
-    const isReduceDebt = hedgeUsd > spotUsd;
-    const diffUsd = Math.abs(spotUsd - hedgeUsd);
-    const adjustmentAmountUnits = new anchor.BN(Math.floor(diffUsd * 1e6));
+  private async evaluateVaultHealth(): Promise<void> {
+    const vault = (await this.program.account.vaultState.fetch(
+      this.vaultPubkey
+    )) as VaultStateAccount;
 
-    const tx = await this.program.methods
-      .rebalanceStrategy(adjustmentAmountUnits, isReduceDebt)
-      .accounts({
-        strategyVault: this.vaultPubkey,
-        keeper: this.wallet.publicKey,
-      })
-      .rpc();
+    if (vault.isFrozen) {
+      console.warn("[SENTINEL] Vault is paused by admin. Skipping rebalance check.");
+      return;
+    }
 
-    console.log(`[SUCCESS] Rebalanced on-chain. TX: ${tx}`);
-  }
+    const depositedUsdc = vault.totalUsdcDeposited.toNumber() / 1e6;
+    const currentHedgedSol = vault.totalHedgedBorrowed.toNumber() / 1e9;
 
-  private async postEnterpriseTelemetry(payload: HealthPayload): Promise<void> {
-    if (!this.webhookUrl) return;
+    console.log(
+      `[SNAPSHOT] Deposited: $${depositedUsdc.toFixed(2)} USDC | Hedged Borrow: ${currentHedgedSol.toFixed(4)} SOL`
+    );
 
+    // Call Rebalance Instruction (Contract independently validates oracle and BPS thresholds)
     try {
-      await axios.post(this.webhookUrl, {
-        username: "AegisDelta Guardian",
+      const tx = await this.program.methods
+        .rebalanceVault()
+        .accounts({
+          keeper: this.wallet.publicKey,
+          vaultState: this.vaultPubkey,
+          vaultAuthority: PublicKey.findProgramAddressSync(
+            [Buffer.from("vault_authority"), this.vaultPubkey.toBuffer()],
+            this.program.programId
+          )[0],
+          vaultHedgedAta: process.env.VAULT_HEDGED_ATA!,
+          pythPriceFeed: vault.pythPriceFeed,
+          marginfiProgram: new PublicKey("MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA"),
+          marginfiBank: vault.marginfiBank,
+          marginfiAccount: process.env.MARGINFI_ACCOUNT_PUBKEY!,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .rpc();
+
+      console.log(`[REBALANCE EXECUTED] Tx: ${tx}`);
+      await this.sendAlert(
+        "Delta Neutral Rebalance Success",
+        `Deviation exceeded safe threshold. Successfully re-indexed delta balance.\n**Tx Signature**: \`${tx}\``,
+        0x00ff00
+      );
+    } catch (err: any) {
+      if (err.message.includes("RebalanceNotNeeded")) {
+        // Healthy state; delta within bounds
+        return;
+      }
+      throw err;
+    }
+  }
+
+  private async sendAlert(title: string, description: string, color: number): Promise<void> {
+    if (!this.discordWebhookUrl) return;
+    try {
+      await axios.post(this.discordWebhookUrl, {
         embeds: [
           {
-            title: "Delta Neutrality Telemetry Heartbeat",
-            color: payload.driftBps > 150 ? 16711680 : 65280,
-            fields: [
-              { name: "Strategy Vault", value: payload.vault, inline: false },
-              { name: "Spot Value (USD)", value: `$${payload.spotValueUsd.toFixed(2)}`, inline: true },
-              { name: "Hedge Value (USD)", value: `$${payload.hedgeValueUsd.toFixed(2)}`, inline: true },
-              { name: "Drift (BPS)", value: `${payload.driftBps.toFixed(2)} bps`, inline: true },
-            ],
-            timestamp: payload.timestamp,
+            title: `[Solana Delta-Router] ${title}`,
+            description,
+            color,
+            timestamp: new Date().toISOString(),
           },
         ],
       });
-    } catch (err: any) {
-      console.error(`[ALERT] Failed to push webhook notification: ${err.message}`);
+    } catch (e: any) {
+      console.error("[ALERT DISPATCH FAIL]", e.message);
     }
   }
 }
 
 // Entrypoint
 if (require.main === module) {
-  const daemon = new AegisDeltaKeeper();
-  daemon.monitorAndRebalance();
+  const sentinel = new DeltaNeutralSentinel();
+  sentinel.startLoop();
 }

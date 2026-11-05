@@ -1,35 +1,27 @@
 version: "3.8"
 
 services:
-  dnyr-keeper:
+  delta-sentinel-keeper:
     build:
       context: .
       dockerfile: Dockerfile
     restart: always
     environment:
-      - PORT=8080
       - SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-      - PROGRAM_ID=DNYR111111111111111111111111111111111111111
-      - USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-      - SOL_MINT=So11111111111111111111111111111111111111112
-      - KEEPER_KEYPAIR_PATH=/etc/secrets/keeper-keypair.json
-      - DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_URL
-      - RESEND_API_KEY=re_123456789
-      - ALERT_EMAIL=ops@enterprise.fi
-    volumes:
-      - ./keeper-keypair.json:/etc/secrets/keeper-keypair.json:ro
-    ports:
-      - "8080:8080"
+      - ROUTER_PROGRAM_ID=DeltaRouter1111111111111111111111111111111111
+      - VAULT_STATE_PUBKEY=Hj8h88YyZtWzB9gDkY7y4gX8tS3Uu4F5Q2eY81Q3mP4r
+      - VAULT_HEDGED_ATA=F7u6h7GjUvWzB9gDkY7y4gX8tS3Uu4F5Q2eY81Q3mP4r
+      - MARGINFI_ACCOUNT_PUBKEY=B5Y8h88YyZtWzB9gDkY7y4gX8tS3Uu4F5Q2eY81Q3mP4r
+      - KEEPER_KEYPAIR_PATH=/run/secrets/keeper-keypair.json
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+    secrets:
+      - keeper-keypair.json
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "5"
 
-  prometheus:
-    image: prom/prometheus:v2.53.0
-    restart: always
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    ports:
-      - "9090:9090"
+secrets:
+  keeper-keypair.json:
+    file: ./secrets/keeper-keypair.json

@@ -1,149 +1,225 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount};
-use crate::errors::AegisError;
-use crate::math::FixedPointMath;
-use crate::state::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use crate::state::{VaultState, VAULT_SEED};
+use crate::errors::RouterError;
+use crate::events::RebalanceEvent;
 
 #[derive(Accounts)]
-pub struct RebalanceStrategy<'info> {
-    #[account(mut)]
+pub struct RebalanceRoute<'info> {
+    #[account(
+        mut,
+        constraint = keeper.key() == vault.keeper || keeper.key() == vault.admin @ RouterError::Unauthorized
+    )]
     pub keeper: Signer<'info>,
 
     #[account(
         mut,
-        seeds = [STRATEGY_SEED, strategy.base_mint.as_ref(), strategy.volatile_mint.as_ref()],
-        bump = strategy.bump,
-        has_one = pyth_oracle_base,
-        has_one = pyth_oracle_volatile
+        seeds = [VAULT_SEED, vault.base_mint.as_ref()],
+        bump = vault.vault_bump,
+        has_one = base_vault,
+        has_one = target_mint
     )]
-    pub strategy: Account<'info, StrategyState>,
+    pub vault: Account<'info, VaultState>,
 
-    /// CHECK: Vault PDA Signer
+    #[account(mut)]
+    pub base_vault: Account<'info, TokenAccount>,
+
+    pub target_mint: Account<'info, Mint>,
+
+    /// Intermediate account receiving borrowed target tokens (SOL)
     #[account(
-        seeds = [VAULT_AUTHORITY_SEED, strategy.key().as_ref()],
-        bump = strategy.auth_bump
+        mut,
+        token::mint = target_mint,
+        token::authority = vault
     )]
-    pub vault_authority: AccountInfo<'info>,
+    pub vault_target_token: Account<'info, TokenAccount>,
 
+    // External CPI interface: Marginfi Program & Accounts
+    /// CHECK: Verified in CPI invoke
+    pub marginfi_program: UncheckedAccount<'info>,
+    /// CHECK: Marginfi group account
+    pub marginfi_group: UncheckedAccount<'info>,
+    /// CHECK: Vault's Marginfi Account PDA
     #[account(mut)]
-    pub vault_base_token: Account<'info, TokenAccount>,
+    pub marginfi_account: UncheckedAccount<'info>,
+    /// CHECK: Marginfi Bank for Base Mint (USDC)
     #[account(mut)]
-    pub vault_volatile_token: Account<'info, TokenAccount>,
+    pub marginfi_base_bank: UncheckedAccount<'info>,
+    /// CHECK: Marginfi Vault for Base Mint
+    #[account(mut)]
+    pub marginfi_base_vault: UncheckedAccount<'info>,
+    /// CHECK: Marginfi Bank for Target Mint (SOL)
+    #[account(mut)]
+    pub marginfi_target_bank: UncheckedAccount<'info>,
+    /// CHECK: Marginfi Vault for Target Mint
+    #[account(mut)]
+    pub marginfi_target_vault: UncheckedAccount<'info>,
 
-    /// Pyth Price Feeds
-    /// CHECK: Validated with has_one on Strategy State
-    pub pyth_oracle_base: AccountInfo<'info>,
-    /// CHECK: Validated with has_one on Strategy State
-    pub pyth_oracle_volatile: AccountInfo<'info>,
-
-    // Kamino CPI Interfaces
-    /// CHECK: Kamino Strategy/Reserve Target Account
+    // External CPI interface: Kamino Lending/Liquidity Program & Accounts
+    /// CHECK: Verified in CPI invoke
+    pub kamino_program: UncheckedAccount<'info>,
+    /// CHECK: Kamino Lending Market
+    pub kamino_market: UncheckedAccount<'info>,
+    /// CHECK: Kamino Reserve for Target Mint
     #[account(mut)]
-    pub kamino_program: AccountInfo<'info>,
-    /// CHECK: Kamino State PDA
+    pub kamino_reserve: UncheckedAccount<'info>,
+    /// CHECK: Kamino Target Reserve Liquidity Supply Account
     #[account(mut)]
-    pub kamino_pool: AccountInfo<'info>,
-
-    // Marginfi CPI Interfaces
-    /// CHECK: Marginfi Program
-    #[account(mut)]
-    pub marginfi_program: AccountInfo<'info>,
-    /// CHECK: Marginfi Account
-    #[account(mut)]
-    pub marginfi_account: AccountInfo<'info>,
-    /// CHECK: Marginfi Bank
-    #[account(mut)]
-    pub marginfi_bank: AccountInfo<'info>,
+    pub kamino_liquidity_supply: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
 
 pub fn handler(
-    ctx: Context<RebalanceStrategy>,
-    target_short_amount: u64,
-    _min_liquidity_out: u64,
+    ctx: Context<RebalanceRoute>,
+    amount_base_to_deposit: u64,
+    amount_target_to_borrow: u64,
+    effective_target_price_scaled: u64, // Normalized target price with 6 decimals
 ) -> Result<()> {
-    let strategy = &mut ctx.accounts.strategy;
+    require!(!ctx.accounts.vault.is_paused, RouterError::VaultPaused);
 
-    // 1. Reentrancy Guard
-    require!(strategy.is_locked == 0, AegisError::ReentrancyGuardTriggered);
-    strategy.is_locked = 1;
+    let vault = &mut ctx.accounts.vault;
 
-    // 2. Oracle Health Verification (Staleness / Confidence)
-    // Production implementations unpack Pyth PriceUpdateV2 payloads
-    let base_price: u64 = 1_000_000; // $1.00 USDC (6 decimals)
-    let volatile_price: u64 = 150_000_000; // $150.00 SOL (6 decimals)
+    // Validate LTV constraint:
+    // (borrowed_target * price) / total_base <= target_ltv_bps / 10000
+    let total_base_collateral = vault.total_managed_base;
+    require!(total_base_collateral > 0, RouterError::InsufficientLiquidity);
 
-    // 3. Current Delta Deviation Check
-    let current_delta = FixedPointMath::compute_delta(
-        strategy.kamino_supplied_amount,
-        strategy.marginfi_borrowed_amount,
-    )?;
+    let prospective_target_total = vault
+        .total_borrowed_target
+        .checked_add(amount_target_to_borrow)
+        .ok_or(RouterError::MathOverflow)?;
 
-    // Derive allowable drift bounds
-    let allowable_drift = (strategy.kamino_supplied_amount as i128)
-        .checked_mul(strategy.max_drift_bps as i128)
-        .unwrap()
-        .checked_div(BPS_DIVISOR as i128)
-        .unwrap();
+    let borrow_value_in_base = (prospective_target_total as u128)
+        .checked_mul(effective_target_price_scaled as u128)
+        .ok_or(RouterError::MathOverflow)?
+        .checked_div(1_000_000) // target price scale
+        .ok_or(RouterError::MathOverflow)? as u64;
 
-    // Verify rebalance necessity or authorization
-    msg!("Current Delta: {}, Permitted Drift: {}", current_delta, allowable_drift);
+    let computed_ltv_bps = ((borrow_value_in_base as u128)
+        .checked_mul(10_000)
+        .ok_or(RouterError::MathOverflow)?
+        .checked_div(total_base_collateral as u128)
+        .ok_or(RouterError::MathOverflow)?) as u16;
 
-    // 4. CPI Execution - Marginfi Borrow Adjustments
-    let strategy_key = strategy.key();
-    let authority_seeds: &[&[&[u8]]] = &[&[
-        VAULT_AUTHORITY_SEED,
-        strategy_key.as_ref(),
-        &[strategy.auth_bump],
-    ]];
+    require!(
+        computed_ltv_bps <= vault.max_ltv_bps,
+        RouterError::LtvLimitExceeded
+    );
 
-    if target_short_amount > strategy.marginfi_borrowed_amount {
-        let borrow_diff = target_short_amount - strategy.marginfi_borrowed_amount;
-        
-        // CPI Call to Marginfi: Borrow volatile asset to neutralize long delta
-        let cpi_program = ctx.accounts.marginfi_program.to_account_info();
-        let cpi_accounts = anchor_lang::prelude::CpiContext::new_with_signer(
-            cpi_program,
-            anchor_lang::prelude::Empty {},
-            authority_seeds,
+    let base_mint_key = vault.base_mint;
+    let seeds = &[
+        VAULT_SEED,
+        base_mint_key.as_ref(),
+        &[vault.vault_bump],
+    ];
+    let signer = &[&seeds[..]];
+
+    // 1. CPI: Transfer base collateral (USDC) from Base Vault to Marginfi Reserve
+    if amount_base_to_deposit > 0 {
+        let deposit_cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.base_vault.to_account_info(),
+                to: ctx.accounts.marginfi_base_vault.to_account_info(),
+                authority: vault.to_account_info(),
+            },
+            signer,
         );
-        // Dispatch Instruction: marginfi::cpi::borrow(cpi_accounts, borrow_diff)
-        msg!("Marginfi CPI: Borrowing {} units of volatile asset", borrow_diff);
-        strategy.marginfi_borrowed_amount = target_short_amount;
-    } else if target_short_amount < strategy.marginfi_borrowed_amount {
-        let repay_diff = strategy.marginfi_borrowed_amount - target_short_amount;
-        
-        // CPI Call to Marginfi: Repay excess short position
-        msg!("Marginfi CPI: Repaying {} units of volatile asset", repay_diff);
-        strategy.marginfi_borrowed_amount = target_short_amount;
+        token::transfer(deposit_cpi_ctx, amount_base_to_deposit)?;
     }
 
-    // 5. Marginfi LTV Solvency Check Post-CPI
-    let post_ltv = FixedPointMath::compute_ltv_bps(
-        strategy.marginfi_collateral_amount,
-        strategy.marginfi_borrowed_amount,
-        volatile_price,
-        base_price,
-    )?;
+    // 2. CPI: Borrow Target Asset (SOL) from Marginfi into Vault Target Token
+    // Marginfi CPI: `marginfi_account_borrow` instruction data layout: [discriminator: 8, amount: 8]
+    if amount_target_to_borrow > 0 {
+        let mut borrow_ix_data = Vec::with_capacity(16);
+        // Anchor Marginfi Borrow ix discriminator
+        let borrow_discriminator: [u8; 8] = [0x50, 0x1d, 0x5a, 0x6e, 0x55, 0x05, 0xcb, 0xc1];
+        borrow_ix_data.extend_from_slice(&borrow_discriminator);
+        borrow_ix_data.extend_from_slice(&amount_target_to_borrow.to_le_bytes());
 
-    require!(post_ltv <= strategy.target_ltv_bps, AegisError::LtvThresholdBreached);
+        let borrow_accounts = vec![
+            AccountMeta::new_readonly(ctx.accounts.marginfi_group.key(), false),
+            AccountMeta::new(ctx.accounts.marginfi_account.key(), false),
+            AccountMeta::new_readonly(vault.key(), true),
+            AccountMeta::new(ctx.accounts.marginfi_target_bank.key(), false),
+            AccountMeta::new(ctx.accounts.marginfi_target_vault.key(), false),
+            AccountMeta::new(ctx.accounts.vault_target_token.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
 
-    // Release reentrancy guard
-    strategy.is_locked = 0;
-    
+        let ix = solana_program::instruction::Instruction {
+            program_id: ctx.accounts.marginfi_program.key(),
+            accounts: borrow_accounts,
+            data: borrow_ix_data,
+        };
+
+        solana_program::program::invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.marginfi_program.to_account_info(),
+                ctx.accounts.marginfi_group.to_account_info(),
+                ctx.accounts.marginfi_account.to_account_info(),
+                vault.to_account_info(),
+                ctx.accounts.marginfi_target_bank.to_account_info(),
+                ctx.accounts.marginfi_target_vault.to_account_info(),
+                ctx.accounts.vault_target_token.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+            signer,
+        )?;
+
+        // 3. CPI: Deposit Borrowed Target Asset (SOL) into Kamino Reserve for Yield
+        // Kamino Lending CPI: `deposit_reserve_liquidity` instruction layout: [discriminator: 8, liquidity_amount: 8]
+        let mut kamino_ix_data = Vec::with_capacity(16);
+        let kamino_discriminator: [u8; 8] = [0xfa, 0x22, 0xd6, 0x9b, 0x5f, 0x31, 0x10, 0x82];
+        kamino_ix_data.extend_from_slice(&kamino_discriminator);
+        kamino_ix_data.extend_from_slice(&amount_target_to_borrow.to_le_bytes());
+
+        let kamino_accounts = vec![
+            AccountMeta::new(ctx.accounts.vault_target_token.key(), false),
+            AccountMeta::new(ctx.accounts.kamino_liquidity_supply.key(), false),
+            AccountMeta::new(ctx.accounts.kamino_reserve.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.kamino_market.key(), false),
+            AccountMeta::new_readonly(vault.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+
+        let kamino_ix = solana_program::instruction::Instruction {
+            program_id: ctx.accounts.kamino_program.key(),
+            accounts: kamino_accounts,
+            data: kamino_ix_data,
+        };
+
+        solana_program::program::invoke_signed(
+            &kamino_ix,
+            &[
+                ctx.accounts.kamino_program.to_account_info(),
+                ctx.accounts.vault_target_token.to_account_info(),
+                ctx.accounts.kamino_liquidity_supply.to_account_info(),
+                ctx.accounts.kamino_reserve.to_account_info(),
+                ctx.accounts.kamino_market.to_account_info(),
+                vault.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+            signer,
+        )?;
+
+        vault.total_borrowed_target = prospective_target_total;
+        vault.total_deployed_target = vault
+            .total_deployed_target
+            .checked_add(amount_target_to_borrow)
+            .ok_or(RouterError::MathOverflow)?;
+    }
+
     emit!(RebalanceEvent {
+        keeper: ctx.accounts.keeper.key(),
+        collateral_deposited_mfi: amount_base_to_deposit,
+        borrowed_target_mfi: amount_target_to_borrow,
+        supplied_target_kamino: amount_target_to_borrow,
+        current_ltv_bps: computed_ltv_bps,
         timestamp: Clock::get()?.unix_timestamp,
-        net_delta: FixedPointMath::compute_delta(strategy.kamino_supplied_amount, strategy.marginfi_borrowed_amount)?,
-        ltv_bps: post_ltv,
     });
 
     Ok(())
-}
-
-#[event]
-pub struct RebalanceEvent {
-    pub timestamp: i64,
-    pub net_delta: i128,
-    pub ltv_bps: u16,
 }

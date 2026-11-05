@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  delta-neutral-keeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dn-routing-keeper
+    restart: always
+    environment:
+      - SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}
+      - ROUTER_PROGRAM_ID=DNRouter111111111111111111111111111111111
+      - KEEPER_KEYPAIR_PATH=/secrets/keeper-keypair.json
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - ALERT_RECIPIENT_EMAIL=ops@enterprisecapital.fi
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+    volumes:
+      - ./secrets:/secrets:ro
+    ports:
+      - "8080:8080"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"

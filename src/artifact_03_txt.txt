@@ -1,14 +1,15 @@
-+-----------------------------------------------------------------------------------+
-|                            AETHERYIELD RUNTIME TOPOLOGY                           |
-+-----------------------------------------------------------------------------------+
-|  [Off-Chain Keeper Node]                                                          |
-|      |-- Polling Loop: Pyth EMA Price & Confidence, Kamino APY, Marginfi APY      |
-|      |-- Health Check HTTP Server (:8080/healthz, :8080/metrics)                  |
-|      |-- Discord / Slack Webhook Dispatcher (Real-time alerting on state shifts)   |
-|      \-- Resend API (Critical escalation: Circuit Breaker trip, Oracle Stale)     |
-|                                                                                   |
-|  [On-Chain CPI Interfaces]                                                        |
-|      |-- Kamino Lending: `kamino_lending_program` (DepositReserveLiquidity)       |
-|      |-- Marginfi Core:  `marginfi_program` (LendingAccountDeposit / Borrow)      |
-|      \-- Pyth SDK:       `pyth_solana_receiver_sdk` (Price update verification)   |
-+-----------------------------------------------------------------------------------+
+programs/delta-neutral-router/
+├── Cargo.toml
+└── src/
+    ├── errors.rs
+    ├── events.rs
+    ├── instructions/
+    │   ├── deposit.rs
+    │   ├── emergency_unwind.rs
+    │   ├── harvest_and_compound.rs
+    │   ├── initialize.rs
+    │   ├── mod.rs
+    │   ├── rebalance_route.rs
+    │   └── withdraw.rs
+    ├── lib.rs
+    └── state.rs

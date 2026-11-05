@@ -1,0 +1,22 @@
+1/4 🚀 Introducing the Delta-Neutral Yield Router on @Solana!
+
+We engineered an institutional-grade @AnchorLang smart contract that programmatically harvests real basis spreads across @kamino_finance and @marginfi—eliminating market beta while unlocking double-digit net yields. ⚡️💎
+
+Here is how it works 👇🧵
+
+2/4 ⚙️ Atomic Cross-Program Invocations (CPI)
+Instead of disjointed, manual reallocations, our router executes atomic deposits into Kamino Lend and offsetting borrows on Marginfi within a single transaction.
+
+✅ PDA-isolated risk accounts
+✅ Real-time LTV & liquidation buffers
+✅ 0% directional exposure
+
+3/4 🛡 Enterprise Telemetry & Turnkey Autonomy
+Backed by an autonomous keeper agent that tracks dynamic yield curves 24/7. When APY spreads drift >50 bps, atomic rebalances fire with real-time audit receipts streaming to Discord, Slack & @resend. Turnkey Dockerized deployment in < 60s.
+
+4/4 🏆 Built for the Solana Hackathon / Bounty Challenge.
+100% test coverage, comprehensive Anchor QA matrix, zero-stub Rust source code, and institutional security invariants.
+
+Full GitHub repo & live deploy script: https://github.com/enterprise-defi/delta-neutral-router
+
+Tagging @kamino_finance @marginfi @solana 🚀🔥

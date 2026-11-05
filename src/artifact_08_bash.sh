@@ -1,1 +1,1 @@
-anchor keys sync
+npx ts-node ./src/cli/panic-unwind.ts --vault <VAULT_PUBKEY> --keypair ./authority-keypair.json

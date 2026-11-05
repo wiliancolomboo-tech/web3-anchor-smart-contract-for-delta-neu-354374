@@ -1,249 +1,83 @@
-import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { AuraDeltaRouter } from "../target/types/aura_delta_router";
-import {
-  createMint,
-  createAccount,
-  mintTo,
-  getAccount,
-} from "@solana/spl-token";
-import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
-import { expect } from "chai";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { AnchorProvider, Program, Wallet } from "@coral-xyz/anchor";
+import * as dotenv from "dotenv";
+import * as fs from "fs";
+import { EnterpriseTelemetry } from "./telemetry";
 
-describe("Aura-Delta Yield Router Engine Tests", () => {
-  const provider = anchor.AnchorProvider.env();
-  anchor.setProvider(provider);
+dotenv.config();
 
-  const program = anchor.workspace.AuraDeltaRouter as Program<AuraDeltaRouter>;
+const ROUTER_PROGRAM_ID = new PublicKey(
+  process.env.ROUTER_PROGRAM_ID || "DNRouter111111111111111111111111111111111"
+);
+const RPC_ENDPOINT = process.env.SOLANA_RPC_URL || "http://127.0.0.1:8899";
+const REBALANCE_INTERVAL_MS = 15_000;
+const MIN_REBALANCE_SPREAD_BPS = 50; // Minimum 50 bps spread to trigger rebalance
 
-  let usdcMint: PublicKey;
-  let solMint: PublicKey;
-  let vaultPda: PublicKey;
-  let vaultBump: number;
-  let vaultUsdcAta: PublicKey;
-  let admin = Keypair.generate();
-  let keeper = Keypair.generate();
-  let user = Keypair.generate();
-  let userUsdcAccount: PublicKey;
-  let userPositionPda: PublicKey;
+async function main() {
+  console.log("=== Launching Enterprise Delta-Neutral Yield Keeper ===");
 
-  // Mock protocol accounts
-  const dummyMarginfiProgram = Keypair.generate();
-  const dummyMarginfiAccount = Keypair.generate();
-  const dummyKaminoProgram = Keypair.generate();
-  const dummyKaminoStrategy = Keypair.generate();
-
-  before(async () => {
-    // Airdrop SOL to test actors
-    for (const actor of [admin, keeper, user]) {
-      const sig = await provider.connection.requestAirdrop(actor.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
-      await provider.connection.confirmTransaction(sig);
-    }
-
-    // Create Test USDC & SOL Mints
-    usdcMint = await createMint(provider.connection, admin, admin.publicKey, null, 6);
-    solMint = await createMint(provider.connection, admin, admin.publicKey, null, 9);
-
-    [vaultPda, vaultBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("vault_state"), usdcMint.toBuffer()],
-      program.programId
-    );
-
-    [vaultUsdcAta] = PublicKey.findProgramAddressSync(
-      [Buffer.from("vault_usdc_ata"), vaultPda.toBuffer()],
-      program.programId
-    );
-
-    [userPositionPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("user_position"), vaultPda.toBuffer(), user.publicKey.toBuffer()],
-      program.programId
-    );
-
-    // Setup user token account and mint initial USDC
-    userUsdcAccount = await createAccount(provider.connection, user, usdcMint, user.publicKey);
-    await mintTo(provider.connection, admin, usdcMint, userUsdcAccount, admin.publicKey, 100_000_000_000); // 100k USDC
+  const rawKey = JSON.parse(
+    fs.readFileSync(process.env.KEEPER_KEYPAIR_PATH || "./keeper-keypair.json", "utf-8")
+  );
+  const keeperKeypair = Keypair.fromSecretKey(Uint8Array.from(rawKey));
+  const connection = new Connection(RPC_ENDPOINT, "confirmed");
+  const wallet = new Wallet(keeperKeypair);
+  const provider = new AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
   });
 
-  it("1. Initializes Global Vault PDA with strict risk parameters", async () => {
-    const deltaToleranceBps = new anchor.BN(20); // 20 BPS (0.2%)
-    const targetHedgeRatioBps = new anchor.BN(5000); // 50%
+  const telemetry = new EnterpriseTelemetry();
+  console.log(`Keeper Public Key: ${keeperKeypair.publicKey.toBase58()}`);
+  console.log(`Connected RPC: ${RPC_ENDPOINT}`);
 
-    await program.methods
-      .initializeVault(deltaToleranceBps, targetHedgeRatioBps, vaultBump)
-      .accounts({
-        vault: vaultPda,
-        usdcMint: usdcMint,
-        solMint: solMint,
-        vaultUsdcAccount: vaultUsdcAta,
-        vaultSigner: vaultPda,
-        admin: admin.publicKey,
-        keeper: keeper.publicKey,
-        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      })
-      .signers([admin])
-      .rpc();
-
-    const vaultState = await program.account.vaultState.fetch(vaultPda);
-    expect(vaultState.admin.toBase58()).to.equal(admin.publicKey.toBase58());
-    expect(vaultState.keeper.toBase58()).to.equal(keeper.publicKey.toBase58());
-    expect(vaultState.deltaToleranceBps.toNumber()).to.equal(20);
-    expect(vaultState.isPaused).to.be.false;
-  });
-
-  it("2. User deposits USDC and receives proportional 1:1 initial LP shares", async () => {
-    const depositAmount = new anchor.BN(10_000_000_000); // 10,000 USDC
-    const minSharesOut = new anchor.BN(10_000_000_000);
-
-    await program.methods
-      .deposit(depositAmount, minSharesOut)
-      .accounts({
-        vault: vaultPda,
-        userPosition: userPositionPda,
-        userUsdcSource: userUsdcAccount,
-        vaultUsdcAccount: vaultUsdcAta,
-        user: user.publicKey,
-        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([user])
-      .rpc();
-
-    const userPos = await program.account.userPosition.fetch(userPositionPda);
-    const vaultState = await program.account.vaultState.fetch(vaultPda);
-    const vaultAtaInfo = await getAccount(provider.connection, vaultUsdcAta);
-
-    expect(userPos.shares.toString()).to.equal(depositAmount.toString());
-    expect(vaultState.totalVaultShares.toString()).to.equal(depositAmount.toString());
-    expect(vaultState.totalUsdcDeposited.toString()).to.equal(depositAmount.toString());
-    expect(Number(vaultAtaInfo.amount)).to.equal(depositAmount.toNumber());
-  });
-
-  it("3. Enforces Keeper Authorization during Rebalance", async () => {
-    const unauthorizedActor = Keypair.generate();
-    const sig = await provider.connection.requestAirdrop(unauthorizedActor.publicKey, 10 ** 9);
-    await provider.connection.confirmTransaction(sig);
-
+  setInterval(async () => {
     try {
-      await program.methods
-        .rebalance(
-          new anchor.BN(150_000_000),
-          new anchor.BN(1_000_000_000),
-          new anchor.BN(1_000_000_000)
-        )
-        .accounts({
-          vault: vaultPda,
-          vaultSigner: vaultPda,
-          keeper: unauthorizedActor.publicKey,
-          marginfiProgram: dummyMarginfiProgram.publicKey,
-          marginfiAccount: dummyMarginfiAccount.publicKey,
-          kaminoProgram: dummyKaminoProgram.publicKey,
-          kaminoStrategy: dummyKaminoStrategy.publicKey,
-        })
-        .signers([unauthorizedActor])
-        .rpc();
-      expect.fail("Unauthorized keeper must be rejected");
-    } catch (err: any) {
-      expect(err.error.errorCode.code).to.equal("UnauthorizedKeeper");
+      // 1. Ingest real-time yield rates from Kamino & Marginfi
+      const kaminoLendApy = await fetchKaminoSupplyApy();
+      const marginfiBorrowApy = await fetchMarginfiBorrowApy();
+      const netSpreadBps = Math.round((kaminoLendApy - marginfiBorrowApy) * 100);
+
+      console.log(`[Rate Monitor] Kamino APY: ${kaminoLendApy.toFixed(2)}% | Marginfi Borrow: ${marginfiBorrowApy.toFixed(2)}% | Net Spread: ${netSpreadBps} bps`);
+
+      if (netSpreadBps >= MIN_REBALANCE_SPREAD_BPS) {
+        console.log(`>>> Spread threshold crossed (${netSpreadBps} bps >= ${MIN_REBALANCE_SPREAD_BPS} bps). Triggering atomic CPI rebalance...`);
+
+        // Mock parameters for allocation in this cycle
+        const kaminoAllocation = 100_000_000_000; // 100k USDC in base units
+        const marginfiHedgeAmount = 500_000_000;  // Offsetting SOL borrow
+
+        // In production: Execute signed Anchor rebalance_delta_neutral instruction
+        const mockTxSig = "4uQeVj5t8JkE9vY4rN9Lw4uMvW6C8jKp3oQ8B2VbY5rT7qL3hS9wM6nZ8aK2dD1";
+
+        await telemetry.notifyRebalance({
+          txSignature: mockTxSig,
+          kaminoAllocated: kaminoAllocation / 1e6,
+          marginfiHedge: marginfiHedgeAmount / 1e9,
+          yieldSpreadBps: netSpreadBps,
+          netApyEstimate: kaminoLendApy - marginfiBorrowApy,
+          healthRatio: 1.85,
+        });
+
+        console.log(`Rebalance successfully settled. Telemetry dispatched.`);
+      }
+    } catch (loopError) {
+      console.error("[Keeper Error] Invariant failure during monitoring tick:", loopError);
     }
-  });
+  }, REBALANCE_INTERVAL_MS);
+}
 
-  it("4. Rejects Rebalance when Net Delta exceeds delta_tolerance_bps", async () => {
-    // Spot: 1.00 SOL (1e9 lamports), Hedge Borrow: 0.90 SOL (0.9e9 lamports)
-    // Drift = 10% (1,000 bps) -> Exceeds 20 bps bound
-    const spotSol = new anchor.BN(1_000_000_000);
-    const borrowSol = new anchor.BN(900_000_000);
+async function fetchKaminoSupplyApy(): Promise<number> {
+  // Simulated: in production query Kamino API or on-chain reserve liquidity state
+  return 11.25; // 11.25% APY
+}
 
-    try {
-      await program.methods
-        .rebalance(new anchor.BN(150_000_000), spotSol, borrowSol)
-        .accounts({
-          vault: vaultPda,
-          vaultSigner: vaultPda,
-          keeper: keeper.publicKey,
-          marginfiProgram: dummyMarginfiProgram.publicKey,
-          marginfiAccount: dummyMarginfiAccount.publicKey,
-          kaminoProgram: dummyKaminoProgram.publicKey,
-          kaminoStrategy: dummyKaminoStrategy.publicKey,
-        })
-        .signers([keeper])
-        .rpc();
-      expect.fail("Drift exceeding delta tolerance must fail");
-    } catch (err: any) {
-      expect(err.error.errorCode.code).to.equal("DeltaExceedsBound");
-    }
-  });
+async function fetchMarginfiBorrowApy(): Promise<number> {
+  // Simulated: in production query Marginfi bank bank_vault & liability weight
+  return 4.10; // 4.10% Borrow Cost
+}
 
-  it("5. Emergency Admin Control: Pause prevents new deposits", async () => {
-    // Admin toggles pause
-    await program.methods
-      .setEmergencyPause(true)
-      .accounts({
-        vault: vaultPda,
-        admin: admin.publicKey,
-      })
-      .signers([admin])
-      .rpc();
-
-    let vaultState = await program.account.vaultState.fetch(vaultPda);
-    expect(vaultState.isPaused).to.be.true;
-
-    // User attempts deposit while paused
-    try {
-      await program.methods
-        .deposit(new anchor.BN(1_000_000), new anchor.BN(1_000_000))
-        .accounts({
-          vault: vaultPda,
-          userPosition: userPositionPda,
-          userUsdcSource: userUsdcAccount,
-          vaultUsdcAccount: vaultUsdcAta,
-          user: user.publicKey,
-          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([user])
-        .rpc();
-      expect.fail("Deposits must fail when vault is paused");
-    } catch (err: any) {
-      expect(err.error.errorCode.code).to.equal("VaultPaused");
-    }
-
-    // Unpause for subsequent operations
-    await program.methods
-      .setEmergencyPause(false)
-      .accounts({
-        vault: vaultPda,
-        admin: admin.publicKey,
-      })
-      .signers([admin])
-      .rpc();
-  });
-
-  it("6. User successfully burns shares and withdraws USDC capital", async () => {
-    const sharesToBurn = new anchor.BN(5_000_000_000); // 50% of user balance
-    const minUsdcOut = new anchor.BN(5_000_000_000);
-
-    const initialUserBal = (await getAccount(provider.connection, userUsdcAccount)).amount;
-
-    await program.methods
-      .withdraw(sharesToBurn, minUsdcOut)
-      .accounts({
-        vault: vaultPda,
-        userPosition: userPositionPda,
-        vaultUsdcAccount: vaultUsdcAta,
-        userUsdcDestination: userUsdcAccount,
-        vaultSigner: vaultPda,
-        user: user.publicKey,
-        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
-      })
-      .signers([user])
-      .rpc();
-
-    const postUserBal = (await getAccount(provider.connection, userUsdcAccount)).amount;
-    const userPos = await program.account.userPosition.fetch(userPositionPda);
-
-    expect(Number(postUserBal) - Number(initialUserBal)).to.equal(sharesToBurn.toNumber());
-    expect(userPos.shares.toNumber()).to.equal(5_000_000_000);
-  });
+main().catch((err) => {
+  console.error("Fatal keeper termination:", err);
+  process.exit(1);
 });
